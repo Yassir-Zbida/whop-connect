@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,28 +24,150 @@ dotenv.config();
 
 import express from 'express';
 import session from 'express-session';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcrypt';
 import Whop from '@whop/sdk';
+
 const app = express();
 const PORT = process.env.PORT || 3001;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Trust first proxy (for rate limit IP and secure cookies behind reverse proxy)
+if (isProduction) app.set('trust proxy', 1);
 
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ? String(process.env.ADMIN_PASSWORD).trim() : '';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'whop-admin-secret-change-in-production';
-const WHOP_API_KEY = process.env.WHOP_API_KEY;
-const WHOP_PARENT_COMPANY_ID = process.env.WHOP_PARENT_COMPANY_ID;
 
-if (!ADMIN_PASSWORD) {
-  console.warn('Set ADMIN_PASSWORD in .env for admin login.');
+// Settings file (Whop API key, company ID, dashboard password) – overrides .env when set
+const DATA_DIR = path.join(__dirname, 'data');
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+
+function readSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const raw = fs.readFileSync(SETTINGS_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      return {
+        whopApiKey: typeof data.whopApiKey === 'string' ? data.whopApiKey.trim() : '',
+        whopCompanyId: typeof data.whopCompanyId === 'string' ? data.whopCompanyId.trim() : '',
+        adminPasswordHash: typeof data.adminPasswordHash === 'string' ? data.adminPasswordHash : '',
+      };
+    }
+  } catch (e) {
+    console.warn('settings read error:', e?.message);
+  }
+  return { whopApiKey: '', whopCompanyId: '', adminPasswordHash: '' };
 }
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+function writeSettings(data) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const toWrite = {
+      whopApiKey: data.whopApiKey ?? '',
+      whopCompanyId: data.whopCompanyId ?? '',
+      adminPasswordHash: data.adminPasswordHash ?? '',
+    };
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(toWrite, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('settings write error:', e?.message);
+    throw e;
+  }
+}
+
+const BCRYPT_ROUNDS = 12;
+
+function legacyHashPassword(password) {
+  const secret = SESSION_SECRET || 'salt';
+  return crypto.createHash('sha256').update(secret + password, 'utf8').digest('hex');
+}
+
+async function hashPassword(password) {
+  return bcrypt.hash(password, BCRYPT_ROUNDS);
+}
+
+async function verifyAdminPassword(plainPassword) {
+  const settings = readSettings();
+  if (settings.adminPasswordHash) {
+    const stored = settings.adminPasswordHash;
+    if (stored.startsWith('$2')) return bcrypt.compare(plainPassword, stored);
+    return legacyHashPassword(plainPassword) === stored;
+  }
+  return plainPassword === ADMIN_PASSWORD;
+}
+
+function getWhopConfig() {
+  const s = readSettings();
+  return {
+    apiKey: s.whopApiKey || process.env.WHOP_API_KEY || '',
+    companyId: s.whopCompanyId || process.env.WHOP_PARENT_COMPANY_ID || '',
+  };
+}
+
+function getWhop() {
+  const c = getWhopConfig();
+  if (c.apiKey && c.companyId) return new Whop({ apiKey: c.apiKey });
+  return null;
+}
+
+function getWhopCompanyId() {
+  return getWhopConfig().companyId;
+}
+
+const adminPasswordEffective = () => {
+  const s = readSettings();
+  if (s.adminPasswordHash) return '(set in Settings)';
+  return ADMIN_PASSWORD ? 'set' : 'not set';
+};
+
+if (!ADMIN_PASSWORD && !readSettings().adminPasswordHash) {
+  console.warn('Set ADMIN_PASSWORD in .env or configure password in Settings for admin login.');
+}
+if (isProduction && (!SESSION_SECRET || SESSION_SECRET === 'whop-admin-secret-change-in-production')) {
+  console.warn('SECURITY: Set a strong SESSION_SECRET in .env for production.');
+}
+
+// Security: HTTP headers (X-Content-Type-Options, X-Frame-Options, etc.)
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'same-site' },
+  })
+);
+
+// Rate limiting: strict for login, general for API
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  message: { error: 'Too many requests. Try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Body parser with size limit to prevent large payloads
+app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
+
 app.use(
   session({
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 },
+    name: 'whop.sid',
+    cookie: {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    },
   })
 );
 
@@ -66,17 +189,23 @@ api.get('/me', (req, res) => {
   return res.json({ user: req.session?.user ?? null });
 });
 
-api.post('/login', (req, res) => {
+api.post('/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body || {};
   const u = username != null ? String(username).trim() : '';
   const p = password != null ? String(password) : '';
   if (!u || !p) {
     return res.status(400).json({ error: 'Missing username or password' });
   }
-  if (!ADMIN_PASSWORD) {
-    return res.status(503).json({ error: 'Server misconfigured', message: 'ADMIN_PASSWORD is not set. Add .env and restart the app.' });
+  let passwordOk = false;
+  try {
+    passwordOk = await verifyAdminPassword(p);
+  } catch (_) {
+    return res.status(500).json({ error: 'Server error', message: 'Could not verify password.' });
   }
-  if (u === ADMIN_USERNAME && p === ADMIN_PASSWORD) {
+  if (!passwordOk && !readSettings().adminPasswordHash && !ADMIN_PASSWORD) {
+    return res.status(503).json({ error: 'Server misconfigured', message: 'ADMIN_PASSWORD is not set. Add .env or set password in Settings.' });
+  }
+  if (u === ADMIN_USERNAME && passwordOk) {
     req.session.user = { username: ADMIN_USERNAME };
     return res.json({ ok: true });
   }
@@ -99,16 +228,18 @@ api.get('/health', (req, res) => {
   return res.json({ ok: true });
 });
 
-// Debug endpoint: env/path status only (no secrets). Remove or restrict in production if desired.
+// Debug endpoint: env/path status only (no secrets). Disabled in production.
 api.get('/debug-env', (req, res) => {
+  if (isProduction) return res.status(404).json({ error: 'Not found' });
   const hostingerEnvPath = path.join(process.cwd(), '.builds', 'config', '.env');
   const rootEnvPath = path.join(process.cwd(), '.env');
+  const config = getWhopConfig();
   return res.json({
-    adminPasswordSet: Boolean(process.env.ADMIN_PASSWORD),
+    adminPasswordSet: Boolean(adminPasswordEffective()),
     adminUsername: process.env.ADMIN_USERNAME || '(default: admin)',
     sessionSecretSet: Boolean(process.env.SESSION_SECRET),
-    whopApiKeySet: Boolean(process.env.WHOP_API_KEY),
-    whopCompanyIdSet: Boolean(process.env.WHOP_PARENT_COMPANY_ID),
+    whopApiKeySet: Boolean(config.apiKey),
+    whopCompanyIdSet: Boolean(config.companyId),
     cwd: process.cwd(),
     hostingerEnvPath,
     hostingerEnvExists: fs.existsSync(hostingerEnvPath),
@@ -116,19 +247,53 @@ api.get('/debug-env', (req, res) => {
   });
 });
 
-// ——— Whop API (protected) ———
-const whop =
-  WHOP_API_KEY && WHOP_PARENT_COMPANY_ID
-    ? new Whop({ apiKey: WHOP_API_KEY })
-    : null;
+// ——— Settings (protected): read/update Whop API key, company ID, dashboard password ———
+api.get('/settings', requireAuth, (req, res) => {
+  const config = getWhopConfig();
+  const key = config.apiKey;
+  const masked = key ? (key.slice(0, 8) + '…' + key.slice(-4)) : '';
+  return res.json({
+    whopApiKeySet: Boolean(key),
+    whopCompanyIdSet: Boolean(config.companyId),
+    whopApiKeyMasked: masked || null,
+    whopCompanyId: config.companyId || null,
+    adminPasswordSet: Boolean(readSettings().adminPasswordHash) || Boolean(ADMIN_PASSWORD),
+  });
+});
 
+api.put('/settings', requireAuth, async (req, res) => {
+  const { whopApiKey, whopCompanyId, currentPassword, newPassword } = req.body || {};
+  const settings = readSettings();
+
+  if (typeof whopApiKey === 'string') settings.whopApiKey = whopApiKey.trim();
+  if (typeof whopCompanyId === 'string') settings.whopCompanyId = whopCompanyId.trim();
+
+  if (typeof newPassword === 'string' && newPassword.trim()) {
+    if (!currentPassword || typeof currentPassword !== 'string') {
+      return res.status(400).json({ error: 'Current password is required to set a new password.' });
+    }
+    try {
+      const valid = await verifyAdminPassword(currentPassword);
+      if (!valid) return res.status(401).json({ error: 'Invalid current password.' });
+    } catch (_) {
+      return res.status(500).json({ error: 'Server error', message: 'Could not verify password.' });
+    }
+    settings.adminPasswordHash = await hashPassword(newPassword.trim());
+  }
+
+  writeSettings(settings);
+  return res.json({ ok: true, message: 'Settings saved.' });
+});
+
+// ——— Whop API (protected) ———
 api.get('/companies', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.json({ data: [] });
   }
   try {
     const page = await whop.companies.list({
-      parent_company_id: WHOP_PARENT_COMPANY_ID,
+      parent_company_id: getWhopCompanyId(),
       first: 100,
     });
     return res.json({ data: page.data || [] });
@@ -138,10 +303,11 @@ api.get('/companies', requireAuth, async (req, res) => {
 });
 
 api.post('/companies', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
     });
   }
   try {
@@ -158,7 +324,7 @@ api.post('/companies', requireAuth, async (req, res) => {
 
     const company = await whop.companies.create({
       email: String(email).trim(),
-      parent_company_id: WHOP_PARENT_COMPANY_ID,
+      parent_company_id: getWhopCompanyId(),
       title: String(title).trim(),
       ...(Object.keys(metadata).length ? { metadata } : {}),
     });
@@ -180,10 +346,11 @@ api.post('/companies', requireAuth, async (req, res) => {
 });
 
 api.patch('/companies/:id', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
     });
   }
   const { id } = req.params;
@@ -213,10 +380,11 @@ api.patch('/companies/:id', requireAuth, async (req, res) => {
 });
 
 api.post('/transfers', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
     });
   }
   try {
@@ -238,7 +406,7 @@ api.post('/transfers', requireAuth, async (req, res) => {
     const transfer = await whop.transfers.create({
       amount: numAmount,
       currency: (currency || 'usd').toLowerCase(),
-      origin_id: WHOP_PARENT_COMPANY_ID,
+      origin_id: getWhopCompanyId(),
       destination_id: String(destination_id).trim(),
       ...(metadata && typeof metadata === 'object' && Object.keys(metadata).length
         ? { metadata }
@@ -264,16 +432,17 @@ api.post('/transfers', requireAuth, async (req, res) => {
 
 // ——— Whop API: Transfers (transactions) ———
 api.get('/transfers', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
       data: [],
     });
   }
   try {
     const page = await whop.transfers.list({
-      origin_id: WHOP_PARENT_COMPANY_ID,
+      origin_id: getWhopCompanyId(),
       first: 100,
       order: 'created_at',
       direction: 'desc',
@@ -303,16 +472,17 @@ api.get('/transfers', requireAuth, async (req, res) => {
 
 // ——— Whop API: Members (customers) ———
 api.get('/members', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
       data: [],
     });
   }
   try {
     const page = await whop.members.list({
-      company_id: WHOP_PARENT_COMPANY_ID,
+      company_id: getWhopCompanyId(),
       first: 100,
     });
     const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
@@ -348,10 +518,11 @@ api.get('/members', requireAuth, async (req, res) => {
 });
 
 api.get('/transfers/:id', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
     });
   }
   try {
@@ -379,16 +550,17 @@ api.get('/transfers/:id', requireAuth, async (req, res) => {
 
 // ——— Whop API: Products ———
 api.get('/products', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
       data: [],
     });
   }
   try {
     const page = await whop.products.list({
-      company_id: WHOP_PARENT_COMPANY_ID,
+      company_id: getWhopCompanyId(),
       first: 100,
     });
     const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
@@ -417,10 +589,11 @@ api.get('/products', requireAuth, async (req, res) => {
 });
 
 api.get('/products/:id', requireAuth, async (req, res) => {
+  const whop = getWhop();
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
     });
   }
   try {
@@ -447,7 +620,6 @@ api.get('/products/:id', requireAuth, async (req, res) => {
 });
 
 // ——— Auto-split workflow (persist rules + processed payment IDs) ———
-const DATA_DIR = path.join(__dirname, 'data');
 const AUTO_SPLIT_FILE = path.join(DATA_DIR, 'auto-split.json');
 const MAX_PROCESSED_IDS = 50000;
 
@@ -484,9 +656,10 @@ function writeAutoSplit(data) {
 }
 
 async function runSplitForPayment(paymentId) {
+  const whop = getWhop();
   const state = readAutoSplit();
   if (state.processedPaymentIds.includes(paymentId)) return { ran: false, reason: 'already_processed' };
-  if (!whop || !WHOP_PARENT_COMPANY_ID) return { ran: false, reason: 'not_configured' };
+  if (!whop || !getWhopCompanyId()) return { ran: false, reason: 'not_configured' };
   if (!state.enabled || state.rules.length === 0) return { ran: false, reason: 'disabled_or_no_rules' };
 
   let payment;
@@ -526,7 +699,7 @@ async function runSplitForPayment(paymentId) {
         const transfer = await whop.transfers.create({
           amount: splitAmount,
           currency,
-          origin_id: WHOP_PARENT_COMPANY_ID,
+          origin_id: getWhopCompanyId(),
           destination_id: destId,
           metadata: { payment_id: paymentId, product_id: productId || '', rule_id: rule.id || '', percentage: pct },
         });
@@ -617,10 +790,11 @@ api.post('/webhooks/whop', async (req, res) => {
 
 // Process recent payments (catch-up): list paid payments and run split for any not yet processed
 api.post('/process-payments', requireAuth, async (req, res) => {
-  if (!whop || !WHOP_PARENT_COMPANY_ID) {
+  const whop = getWhop();
+  if (!whop || !getWhopCompanyId()) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in .env',
+      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
     });
   }
   const state = readAutoSplit();
@@ -628,7 +802,7 @@ api.post('/process-payments', requireAuth, async (req, res) => {
   const results = { processed: 0, skipped: 0, errors: [] };
   try {
     const page = await whop.payments.list({
-      company_id: WHOP_PARENT_COMPANY_ID,
+      company_id: getWhopCompanyId(),
       first: 100,
       order: 'paid_at',
       direction: 'desc',
@@ -659,12 +833,13 @@ api.post('/process-payments', requireAuth, async (req, res) => {
 
 // List payments (for UI)
 api.get('/payments', requireAuth, async (req, res) => {
-  if (!whop || !WHOP_PARENT_COMPANY_ID) {
+  const whop = getWhop();
+  if (!whop || !getWhopCompanyId()) {
     return res.status(503).json({ data: [], message: 'Whop not configured' });
   }
   try {
     const page = await whop.payments.list({
-      company_id: WHOP_PARENT_COMPANY_ID,
+      company_id: getWhopCompanyId(),
       first: 50,
       order: 'paid_at',
       direction: 'desc',
@@ -695,7 +870,7 @@ api.get('/payments', requireAuth, async (req, res) => {
 });
 
 // Mount API router at /api (all routes above are now under /api/...)
-app.use('/api', api);
+app.use('/api', apiLimiter, api);
 
 // ——— Serve React SPA (only frontend) ———
 const clientDist = path.join(__dirname, 'client', 'dist');

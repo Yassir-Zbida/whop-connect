@@ -55,6 +55,12 @@ export default function DashboardLayout({ user, onLogout }: Props) {
             </span>
             Logs
           </NavLink>
+          <NavLink to="/settings" className={navClass}>
+            <span className="nav-icon">
+              <Icon d={IconPaths.settings} size={14} />
+            </span>
+            Settings
+          </NavLink>
         </nav>
 
         <div className="sidebar-footer">

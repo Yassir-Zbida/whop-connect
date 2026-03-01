@@ -10,6 +10,7 @@ import Products from './pages/Products';
 import Members from './pages/Members';
 import AutoSplit from './pages/AutoSplit';
 import Logs from './pages/Logs';
+import Settings from './pages/Settings';
 import DashboardLayout from './components/DashboardLayout';
 
 export default function App() {
@@ -81,6 +82,7 @@ export default function App() {
         <Route path="products" element={<Products />} />
         <Route path="members" element={<Members />} />
         <Route path="logs" element={<Logs />} />
+        <Route path="settings" element={<Settings />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

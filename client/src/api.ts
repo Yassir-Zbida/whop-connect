@@ -215,3 +215,28 @@ export async function processPayments(): Promise<{ processed: number; skipped: n
     { method: 'POST' }
   );
 }
+
+// ——— Settings ———
+export type Settings = {
+  whopApiKeySet: boolean;
+  whopCompanyIdSet: boolean;
+  whopApiKeyMasked: string | null;
+  whopCompanyId: string | null;
+  adminPasswordSet: boolean;
+};
+
+export async function getSettings(): Promise<Settings> {
+  return request<Settings>('/api/settings');
+}
+
+export async function updateSettings(body: {
+  whopApiKey?: string;
+  whopCompanyId?: string;
+  currentPassword?: string;
+  newPassword?: string;
+}): Promise<{ ok: boolean; message?: string }> {
+  return request<{ ok: boolean; message?: string }>('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
