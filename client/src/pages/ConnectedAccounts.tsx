@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Icon, IconPaths } from '../components/Icon';
-import { getCompanies, createCompany, createTransfer } from '../api';
+import { getCompanies, createCompany, createTransfer, getSettings } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 
@@ -11,8 +12,10 @@ type Company = {
 };
 
 export default function ConnectedAccounts() {
+  const navigate = useNavigate();
   const [companies, setCompanies] = useState<Company[]>([]);
   const [loading, setLoading] = useState(true);
+  const [whopConfigured, setWhopConfigured] = useState<boolean | null>(null);
   const [enrollEmail, setEnrollEmail] = useState('');
   const [enrollTitle, setEnrollTitle] = useState('');
   const [enrollInternalId, setEnrollInternalId] = useState('');
@@ -29,9 +32,15 @@ export default function ConnectedAccounts() {
 
   const loadCompanies = () => {
     setLoading(true);
-    getCompanies()
-      .then((res) => setCompanies(res.data || []))
-      .catch(() => setCompanies([]))
+    Promise.all([getCompanies(), getSettings()])
+      .then(([companiesRes, settings]) => {
+        setCompanies(companiesRes?.data || []);
+        setWhopConfigured(Boolean(settings?.whopApiKeySet && settings?.whopCompanyIdSet));
+      })
+      .catch(() => {
+        setCompanies([]);
+        setWhopConfigured(false);
+      })
       .finally(() => setLoading(false));
   };
 
@@ -133,6 +142,29 @@ export default function ConnectedAccounts() {
         </div>
 
         <div className="content">
+          {whopConfigured === false && !loading && (
+            <div
+              className="card"
+              style={{
+                marginBottom: 20,
+                borderColor: 'var(--accent-border)',
+                background: 'var(--accent-dim)',
+              }}
+            >
+              <div className="card-body hidden">
+                <p style={{ marginBottom: 12, color: 'var(--text)' }}>
+                  <strong>Setup required.</strong> Add your Whop API key and Company ID in Settings before you can add connected accounts or send funds.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => navigate('/settings')}
+                >
+                  Go to Settings
+                </button>
+              </div>
+            </div>
+          )}
           <div className="card">
             <div className="card-header">
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

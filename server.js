@@ -1,17 +1,15 @@
 /**
- * Whop Admin – Express app with admin login and Whop connected accounts (enroll & send funds).
- * All connected-accounts and API routes require login.
+ * Whop Admin – Multi-user app: sign up, connect your Whop business, set rules.
+ * Data stored in MySQL (users, settings, auto-split per user).
  */
 
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
-import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Load .env from multiple possible locations; later files override earlier
 dotenv.config();
 [
   path.join(__dirname, '.env'),
@@ -27,102 +25,72 @@ import session from 'express-session';
 import helmet from 'helmet';
 import bcrypt from 'bcrypt';
 import Whop from '@whop/sdk';
+import * as db from './db.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
-
-// Trust first proxy (for secure cookies behind reverse proxy)
-if (isProduction) app.set('trust proxy', 1);
-
-const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ? String(process.env.ADMIN_PASSWORD).trim() : '';
+const USE_SECURE_COOKIES = process.env.COOKIE_SECURE === 'true';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'whop-admin-secret-change-in-production';
 
-// Settings file (Whop API key, company ID, dashboard password) – overrides .env when set
-const DATA_DIR = path.join(__dirname, 'data');
-const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
-
-function readSettings() {
-  try {
-    if (fs.existsSync(SETTINGS_FILE)) {
-      const raw = fs.readFileSync(SETTINGS_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      return {
-        whopApiKey: typeof data.whopApiKey === 'string' ? data.whopApiKey.trim() : '',
-        whopCompanyId: typeof data.whopCompanyId === 'string' ? data.whopCompanyId.trim() : '',
-        adminPasswordHash: typeof data.adminPasswordHash === 'string' ? data.adminPasswordHash : '',
-      };
-    }
-  } catch (e) {
-    console.warn('settings read error:', e?.message);
-  }
-  return { whopApiKey: '', whopCompanyId: '', adminPasswordHash: '' };
-}
-
-function writeSettings(data) {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    const toWrite = {
-      whopApiKey: data.whopApiKey ?? '',
-      whopCompanyId: data.whopCompanyId ?? '',
-      adminPasswordHash: data.adminPasswordHash ?? '',
-    };
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(toWrite, null, 2), 'utf8');
-  } catch (e) {
-    console.warn('settings write error:', e?.message);
-    throw e;
-  }
-}
+// Only trust proxy when we know we're behind HTTPS and using secure cookies
+if (USE_SECURE_COOKIES) app.set('trust proxy', 1);
 
 const BCRYPT_ROUNDS = 12;
-
-function legacyHashPassword(password) {
-  const secret = SESSION_SECRET || 'salt';
-  return crypto.createHash('sha256').update(secret + password, 'utf8').digest('hex');
-}
 
 async function hashPassword(password) {
   return bcrypt.hash(password, BCRYPT_ROUNDS);
 }
 
-async function verifyAdminPassword(plainPassword) {
-  const settings = readSettings();
-  if (settings.adminPasswordHash) {
-    const stored = settings.adminPasswordHash;
-    if (stored.startsWith('$2')) return bcrypt.compare(plainPassword, stored);
-    return legacyHashPassword(plainPassword) === stored;
-  }
-  return plainPassword === ADMIN_PASSWORD;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL ? String(process.env.ADMIN_EMAIL).trim().toLowerCase() : '';
+
+function getUserId(req) {
+  return req.session?.user?.id ?? null;
 }
 
-function getWhopConfig() {
-  const s = readSettings();
+function getSessionUser(req) {
+  return req.session?.user ?? null;
+}
+
+function requireAdmin(req, res, next) {
+  if (req.session?.user?.role === 'admin') return next();
+  return res.status(403).json({ error: 'Forbidden', message: 'Admin access required.' });
+}
+
+async function ensureSessionRole(req) {
+  if (!req.session?.user?.id) return;
+  const u = await db.getUserById(req.session.user.id);
+  if (u) {
+    const role = u.role === 'admin' ? 'admin' : 'user';
+    if (req.session.user.role !== role) {
+      req.session.user.role = role;
+    }
+  }
+}
+
+async function getWhopConfig(userId) {
+  if (!userId) return { apiKey: '', companyId: '' };
+  const s = await db.getUserSettings(userId);
+  if (!s) return { apiKey: '', companyId: '' };
   return {
-    apiKey: s.whopApiKey || process.env.WHOP_API_KEY || '',
-    companyId: s.whopCompanyId || process.env.WHOP_PARENT_COMPANY_ID || '',
+    apiKey: s.whop_api_key || '',
+    companyId: s.whop_company_id || '',
   };
 }
 
-function getWhop() {
-  const c = getWhopConfig();
-  if (c.apiKey && c.companyId) return new Whop({ apiKey: c.apiKey });
-  return null;
+function getWhop(userId) {
+  if (!userId) return null;
+  return getWhopConfig(userId).then((c) => {
+    if (c.apiKey && c.companyId) return new Whop({ apiKey: c.apiKey });
+    return null;
+  });
 }
 
-function getWhopCompanyId() {
-  return getWhopConfig().companyId;
+async function getWhopCompanyId(userId) {
+  const c = await getWhopConfig(userId);
+  return c.companyId;
 }
 
-const adminPasswordEffective = () => {
-  const s = readSettings();
-  if (s.adminPasswordHash) return '(set in Settings)';
-  return ADMIN_PASSWORD ? 'set' : 'not set';
-};
-
-if (!ADMIN_PASSWORD && !readSettings().adminPasswordHash) {
-  console.warn('Set ADMIN_PASSWORD in .env or configure password in Settings for admin login.');
-}
 if (isProduction && (!SESSION_SECRET || SESSION_SECRET === 'whop-admin-secret-change-in-production')) {
   console.warn('SECURITY: Set a strong SESSION_SECRET in .env for production.');
 }
@@ -147,9 +115,12 @@ app.use(
     name: 'whop.sid',
     cookie: {
       httpOnly: true,
-      secure: isProduction,
+      // In local dev over http://localhost, COOKIE_SECURE should be false (or unset)
+      // so that cookies are not marked secure and are sent over HTTP.
+      secure: USE_SECURE_COOKIES,
       sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000,
+      path: '/',
     },
   })
 );
@@ -158,51 +129,98 @@ app.use(
 app.use(express.static(path.join(__dirname, 'public')));
 
 function requireAuth(req, res, next) {
-  if (req.session && req.session.user) return next();
+  if (req.session?.user?.id) return next();
   if (req.xhr || req.headers.accept?.includes('application/json')) {
     return res.status(401).json({ error: 'Unauthorized', message: 'Please log in.' });
   }
   return res.redirect('/login');
 }
 
-// ——— API router (mounted at /api so all routes are under /api/*) ———
+// ——— API router (mounted at /api) ———
 const api = express.Router();
 
-api.get('/me', (req, res) => {
-  return res.json({ user: req.session?.user ?? null });
+api.get('/me', async (req, res) => {
+  await ensureSessionRole(req);
+  const u = req.session?.user;
+  if (u && (u.role === undefined || u.role === null)) {
+    u.role = 'user';
+  }
+  return res.json({ user: u ?? null });
+});
+
+api.post('/register', async (req, res) => {
+  const { email, password } = req.body || {};
+  const e = email != null ? String(email).trim().toLowerCase() : '';
+  const p = password != null ? String(password) : '';
+  if (!e || !p) {
+    return res.status(400).json({ error: 'Missing email or password' });
+  }
+  if (p.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+  try {
+    const existing = await db.findUserByEmail(e);
+    if (existing) {
+      return res.status(409).json({ error: 'Email already registered', message: 'Use login instead.' });
+    }
+    const role = ADMIN_EMAIL && e === ADMIN_EMAIL ? 'admin' : 'user';
+    const hash = await hashPassword(p);
+    const userId = await db.createUser(e, hash, role);
+    req.session.user = { id: userId, email: e, role };
+    await db.insertActivityLog({ userId, email: e, action: 'register', message: 'User signed up' });
+    return res.status(201).json({ ok: true, user: { id: userId, email: e, role } });
+  } catch (err) {
+    console.error('Register error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not create account.' });
+  }
 });
 
 api.post('/login', async (req, res) => {
-  const { username, password } = req.body || {};
-  const u = username != null ? String(username).trim() : '';
+  const { email, password } = req.body || {};
+  const e = email != null ? String(email).trim().toLowerCase() : '';
   const p = password != null ? String(password) : '';
-  if (!u || !p) {
-    return res.status(400).json({ error: 'Missing username or password' });
+  if (!e || !p) {
+    return res.status(400).json({ error: 'Missing email or password' });
   }
-  let passwordOk = false;
   try {
-    passwordOk = await verifyAdminPassword(p);
+    const user = await db.findUserByEmail(e);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    if (!user.active) {
+      return res.status(403).json({ error: 'Account deactivated', message: 'Your account has been deactivated. Contact an administrator.' });
+    }
+    const ok = await bcrypt.compare(p, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    let role = user.role === 'admin' ? 'admin' : 'user';
+    if (ADMIN_EMAIL && e === ADMIN_EMAIL && role !== 'admin') {
+      await db.updateUserRole(user.id, 'admin');
+      role = 'admin';
+    }
+    req.session.user = { id: user.id, email: user.email, role };
+    await db.insertActivityLog({ userId: user.id, email: user.email, action: 'login', message: 'User logged in' });
+    return res.json({ ok: true, user: { id: user.id, email: user.email, role: role || 'user' } });
   } catch (_) {
     return res.status(500).json({ error: 'Server error', message: 'Could not verify password.' });
   }
-  if (!passwordOk && !readSettings().adminPasswordHash && !ADMIN_PASSWORD) {
-    return res.status(503).json({ error: 'Server misconfigured', message: 'ADMIN_PASSWORD is not set. Add .env or set password in Settings.' });
-  }
-  if (u === ADMIN_USERNAME && passwordOk) {
-    req.session.user = { username: ADMIN_USERNAME };
-    return res.json({ ok: true });
-  }
-  return res.status(401).json({ error: 'Invalid username or password' });
 });
 
 api.get('/login', (req, res) => {
   return res.status(405).json({
     error: 'Method Not Allowed',
-    message: 'Use POST to log in. If you see this, the request may have been redirected or proxied as GET.',
+    message: 'Use POST to log in.',
   });
 });
 
-api.post('/logout', (req, res) => {
+api.post('/logout', async (req, res) => {
+  const u = req.session?.user;
+  if (u?.id && u?.email) {
+    try {
+      await db.insertActivityLog({ userId: u.id, email: u.email, action: 'logout', message: 'User logged out' });
+    } catch (_) {}
+  }
   req.session.destroy(() => {});
   return res.json({ ok: true });
 });
@@ -211,72 +229,73 @@ api.get('/health', (req, res) => {
   return res.json({ ok: true });
 });
 
-// Debug endpoint: env/path status only (no secrets). Disabled in production.
+// Debug endpoint (no secrets). Disabled in production.
 api.get('/debug-env', (req, res) => {
   if (isProduction) return res.status(404).json({ error: 'Not found' });
-  const hostingerEnvPath = path.join(process.cwd(), '.builds', 'config', '.env');
-  const rootEnvPath = path.join(process.cwd(), '.env');
-  const config = getWhopConfig();
   return res.json({
-    adminPasswordSet: Boolean(adminPasswordEffective()),
-    adminUsername: process.env.ADMIN_USERNAME || '(default: admin)',
     sessionSecretSet: Boolean(process.env.SESSION_SECRET),
-    whopApiKeySet: Boolean(config.apiKey),
-    whopCompanyIdSet: Boolean(config.companyId),
+    dbHost: process.env.DB_HOST || 'localhost',
     cwd: process.cwd(),
-    hostingerEnvPath,
-    hostingerEnvExists: fs.existsSync(hostingerEnvPath),
-    rootEnvExists: fs.existsSync(rootEnvPath),
   });
 });
 
-// ——— Settings (protected): read/update Whop API key, company ID, dashboard password ———
-api.get('/settings', requireAuth, (req, res) => {
-  const config = getWhopConfig();
+// ——— Settings (protected): Whop API key, company ID, webhook URL; change password ———
+api.get('/settings', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const config = await getWhopConfig(userId);
   const key = config.apiKey;
   const masked = key ? (key.slice(0, 8) + '…' + key.slice(-4)) : '';
+  const settings = await db.getUserSettings(userId);
+  const webhookToken = settings?.webhook_token || null;
+  const baseUrl = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
+  const webhookUrl = webhookToken ? `${baseUrl}/api/webhooks/whop/${webhookToken}` : null;
   return res.json({
     whopApiKeySet: Boolean(key),
     whopCompanyIdSet: Boolean(config.companyId),
     whopApiKeyMasked: masked || null,
     whopCompanyId: config.companyId || null,
-    adminPasswordSet: Boolean(readSettings().adminPasswordHash) || Boolean(ADMIN_PASSWORD),
+    adminPasswordSet: true,
+    webhookUrl,
   });
 });
 
 api.put('/settings', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
   const { whopApiKey, whopCompanyId, currentPassword, newPassword } = req.body || {};
-  const settings = readSettings();
-
-  if (typeof whopApiKey === 'string') settings.whopApiKey = whopApiKey.trim();
-  if (typeof whopCompanyId === 'string') settings.whopCompanyId = whopCompanyId.trim();
 
   if (typeof newPassword === 'string' && newPassword.trim()) {
     if (!currentPassword || typeof currentPassword !== 'string') {
       return res.status(400).json({ error: 'Current password is required to set a new password.' });
     }
-    try {
-      const valid = await verifyAdminPassword(currentPassword);
-      if (!valid) return res.status(401).json({ error: 'Invalid current password.' });
-    } catch (_) {
-      return res.status(500).json({ error: 'Server error', message: 'Could not verify password.' });
+    const user = await db.getUserById(userId);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    const fullUser = await db.findUserByEmail(user.email);
+    if (!fullUser || !(await bcrypt.compare(currentPassword, fullUser.password_hash))) {
+      return res.status(401).json({ error: 'Invalid current password.' });
     }
-    settings.adminPasswordHash = await hashPassword(newPassword.trim());
+    await db.updateUserPassword(userId, await hashPassword(newPassword.trim()));
   }
 
-  writeSettings(settings);
+  await db.setUserSettings(userId, { whopApiKey, whopCompanyId });
+  const u = await db.getUserById(userId);
+  await db.insertActivityLog({
+    userId,
+    email: u?.email,
+    action: 'settings_update',
+    message: 'Whop settings or password updated',
+  });
   return res.json({ ok: true, message: 'Settings saved.' });
 });
 
-// ——— Whop API (protected) ———
+// ——— Whop API (protected, scoped by user) ———
 api.get('/companies', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop) {
-    return res.json({ data: [] });
-  }
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) return res.json({ data: [] });
   try {
     const page = await whop.companies.list({
-      parent_company_id: getWhopCompanyId(),
+      parent_company_id: companyId,
       first: 100,
     });
     return res.json({ data: page.data || [] });
@@ -286,11 +305,13 @@ api.get('/companies', requireAuth, async (req, res) => {
 });
 
 api.post('/companies', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
     });
   }
   try {
@@ -307,9 +328,24 @@ api.post('/companies', requireAuth, async (req, res) => {
 
     const company = await whop.companies.create({
       email: String(email).trim(),
-      parent_company_id: getWhopCompanyId(),
+      parent_company_id: companyId,
       title: String(title).trim(),
       ...(Object.keys(metadata).length ? { metadata } : {}),
+    });
+
+    await db.insertConnectedAccount(userId, {
+      companyId: company.id,
+      email: company.email || '',
+      title: company.title || '',
+    });
+
+    const u = await db.getUserById(userId);
+    await db.insertActivityLog({
+      userId,
+      email: u?.email,
+      action: 'company_create',
+      message: `Created company: ${company.title}`,
+      meta: { company_id: company.id },
     });
 
     return res.status(201).json({
@@ -329,11 +365,12 @@ api.post('/companies', requireAuth, async (req, res) => {
 });
 
 api.patch('/companies/:id', requireAuth, async (req, res) => {
-  const whop = getWhop();
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
   if (!whop) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
     });
   }
   const { id } = req.params;
@@ -363,11 +400,13 @@ api.patch('/companies/:id', requireAuth, async (req, res) => {
 });
 
 api.post('/transfers', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
     });
   }
   try {
@@ -389,11 +428,20 @@ api.post('/transfers', requireAuth, async (req, res) => {
     const transfer = await whop.transfers.create({
       amount: numAmount,
       currency: (currency || 'usd').toLowerCase(),
-      origin_id: getWhopCompanyId(),
+      origin_id: companyId,
       destination_id: String(destination_id).trim(),
       ...(metadata && typeof metadata === 'object' && Object.keys(metadata).length
         ? { metadata }
         : {}),
+    });
+
+    const u = await db.getUserById(userId);
+    await db.insertActivityLog({
+      userId,
+      email: u?.email,
+      action: 'transfer_create',
+      message: `Transfer ${transfer.amount} ${transfer.currency} to ${destination_id}`,
+      meta: { transfer_id: transfer.id },
     });
 
     return res.status(201).json({
@@ -415,17 +463,19 @@ api.post('/transfers', requireAuth, async (req, res) => {
 
 // ——— Whop API: Transfers (transactions) ———
 api.get('/transfers', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
       data: [],
     });
   }
   try {
     const page = await whop.transfers.list({
-      origin_id: getWhopCompanyId(),
+      origin_id: companyId,
       first: 100,
       order: 'created_at',
       direction: 'desc',
@@ -455,17 +505,19 @@ api.get('/transfers', requireAuth, async (req, res) => {
 
 // ——— Whop API: Members (customers) ———
 api.get('/members', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
       data: [],
     });
   }
   try {
     const page = await whop.members.list({
-      company_id: getWhopCompanyId(),
+      company_id: companyId,
       first: 100,
     });
     const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
@@ -501,11 +553,12 @@ api.get('/members', requireAuth, async (req, res) => {
 });
 
 api.get('/transfers/:id', requireAuth, async (req, res) => {
-  const whop = getWhop();
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
     });
   }
   try {
@@ -533,17 +586,19 @@ api.get('/transfers/:id', requireAuth, async (req, res) => {
 
 // ——— Whop API: Products ———
 api.get('/products', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
       data: [],
     });
   }
   try {
     const page = await whop.products.list({
-      company_id: getWhopCompanyId(),
+      company_id: companyId,
       first: 100,
     });
     const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
@@ -572,11 +627,12 @@ api.get('/products', requireAuth, async (req, res) => {
 });
 
 api.get('/products/:id', requireAuth, async (req, res) => {
-  const whop = getWhop();
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
     });
   }
   try {
@@ -602,47 +658,13 @@ api.get('/products/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ——— Auto-split workflow (persist rules + processed payment IDs) ———
-const AUTO_SPLIT_FILE = path.join(DATA_DIR, 'auto-split.json');
-const MAX_PROCESSED_IDS = 50000;
-
-function readAutoSplit() {
-  try {
-    if (fs.existsSync(AUTO_SPLIT_FILE)) {
-      const raw = fs.readFileSync(AUTO_SPLIT_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      return {
-        enabled: Boolean(data.enabled),
-        rules: Array.isArray(data.rules) ? data.rules : [],
-        processedPaymentIds: Array.isArray(data.processedPaymentIds) ? data.processedPaymentIds : [],
-      };
-    }
-  } catch (e) {
-    console.warn('auto-split read error:', e?.message);
-  }
-  return { enabled: false, rules: [], processedPaymentIds: [] };
-}
-
-function writeAutoSplit(data) {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    const toWrite = {
-      enabled: data.enabled,
-      rules: data.rules,
-      processedPaymentIds: (data.processedPaymentIds || []).slice(-MAX_PROCESSED_IDS),
-    };
-    fs.writeFileSync(AUTO_SPLIT_FILE, JSON.stringify(toWrite, null, 2), 'utf8');
-  } catch (e) {
-    console.warn('auto-split write error:', e?.message);
-    throw e;
-  }
-}
-
-async function runSplitForPayment(paymentId) {
-  const whop = getWhop();
-  const state = readAutoSplit();
+// ——— Auto-split workflow (per user, from DB) ———
+async function runSplitForPayment(paymentId, userId) {
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  const state = await db.getFullAutoSplit(userId);
   if (state.processedPaymentIds.includes(paymentId)) return { ran: false, reason: 'already_processed' };
-  if (!whop || !getWhopCompanyId()) return { ran: false, reason: 'not_configured' };
+  if (!whop || !companyId) return { ran: false, reason: 'not_configured' };
   if (!state.enabled || state.rules.length === 0) return { ran: false, reason: 'disabled_or_no_rules' };
 
   let payment;
@@ -682,7 +704,7 @@ async function runSplitForPayment(paymentId) {
         const transfer = await whop.transfers.create({
           amount: splitAmount,
           currency,
-          origin_id: getWhopCompanyId(),
+          origin_id: companyId,
           destination_id: destId,
           metadata: { payment_id: paymentId, product_id: productId || '', rule_id: rule.id || '', percentage: pct },
         });
@@ -693,68 +715,97 @@ async function runSplitForPayment(paymentId) {
     }
   }
 
-  state.processedPaymentIds.push(paymentId);
-  writeAutoSplit(state);
+  await db.addProcessedPaymentId(userId, paymentId);
   return { ran: true, transfersCreated, errors };
 }
 
-// Split rules API (protected)
-api.get('/split-rules', requireAuth, (req, res) => {
-  const state = readAutoSplit();
-  return res.json({
-    enabled: state.enabled,
-    rules: state.rules,
-  });
+// Split rules API (protected, per user)
+api.get('/split-rules', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const config = await db.getAutoSplitConfig(userId);
+  const rules = await db.getAutoSplitRules(userId);
+  return res.json({ enabled: config.enabled, rules });
 });
 
-api.patch('/split-rules', requireAuth, (req, res) => {
-  const state = readAutoSplit();
+api.patch('/split-rules', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
   const { enabled } = req.body ?? {};
-  if (typeof enabled === 'boolean') state.enabled = enabled;
-  writeAutoSplit(state);
-  return res.json({ enabled: state.enabled, rules: state.rules });
+  if (typeof enabled === 'boolean') {
+    await db.setAutoSplitEnabled(userId, enabled);
+  }
+  const config = await db.getAutoSplitConfig(userId);
+  const rules = await db.getAutoSplitRules(userId);
+  return res.json({ enabled: config.enabled, rules });
 });
 
-api.post('/split-rules', requireAuth, (req, res) => {
-  const state = readAutoSplit();
+api.post('/split-rules', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
   const { productId, planId, splits } = req.body ?? {};
   if (!Array.isArray(splits) || splits.length === 0) {
     return res.status(400).json({ error: 'Invalid request', message: 'splits array is required and must not be empty.' });
   }
-  const id = 'rule_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
-  const rule = {
-    id,
+  const rule = await db.createAutoSplitRule(userId, {
     productId: productId?.trim() || null,
     planId: planId?.trim() || null,
     splits: splits.map((s) => ({
       destination_id: String(s.destination_id ?? '').trim(),
       percentage: Number(s.percentage) || 0,
-    })).filter((s) => s.destination_id && s.percentage > 0),
-    createdAt: new Date().toISOString(),
-  };
-  if (rule.splits.length === 0) {
+    })),
+  });
+  if (!rule || !rule.splits?.length) {
     return res.status(400).json({ error: 'Invalid request', message: 'At least one split with destination_id and percentage is required.' });
   }
-  state.rules.push(rule);
-  writeAutoSplit(state);
+  const u = await db.getUserById(userId);
+  await db.insertActivityLog({
+    userId,
+    email: u?.email,
+    action: 'split_rule_create',
+    message: `Auto-split rule created`,
+    meta: { rule_id: rule.id },
+  });
   return res.status(201).json(rule);
 });
 
-api.delete('/split-rules/:id', requireAuth, (req, res) => {
-  const state = readAutoSplit();
-  const before = state.rules.length;
-  state.rules = state.rules.filter((r) => r.id !== req.params.id);
-  if (state.rules.length === before) {
+api.delete('/split-rules/:id', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const deleted = await db.deleteAutoSplitRule(req.params.id, userId);
+  if (!deleted) {
     return res.status(404).json({ error: 'Not found', message: 'Rule not found.' });
   }
-  writeAutoSplit(state);
-  return res.json({ ok: true, rules: state.rules });
+  const u = await db.getUserById(userId);
+  await db.insertActivityLog({
+    userId,
+    email: u?.email,
+    action: 'split_rule_delete',
+    message: `Auto-split rule deleted`,
+    meta: { rule_id: req.params.id },
+  });
+  const rules = await db.getAutoSplitRules(userId);
+  return res.json({ ok: true, rules });
 });
 
-// Webhook: Whop payment.succeeded (no auth; verify with WHOP_WEBHOOK_SECRET if set)
-api.post('/webhooks/whop', async (req, res) => {
+// Webhook: Whop payment.succeeded — URL includes user's token so we know which account to run split for
+api.post('/webhooks/whop/:token', async (req, res) => {
+  const token = req.params.token;
+  const user = await db.getUserByWebhookToken(token);
+  if (!user) {
+    try {
+      await db.insertActivityLog({ action: 'webhook_unknown_token', message: 'Webhook received with unknown token', meta: { token_prefix: token.slice(0, 8) } });
+    } catch (_) {}
+    return res.status(404).json({ received: true, error: 'Unknown webhook token' });
+  }
   const body = req.body || {};
   const type = body?.type || body?.action;
+  const u = await db.getUserById(user.id);
+  try {
+    await db.insertActivityLog({
+      userId: user.id,
+      email: u?.email,
+      action: 'webhook_received',
+      message: type === 'payment.succeeded' ? 'Payment succeeded webhook' : `Webhook: ${type || 'unknown'}`,
+      meta: type ? { type, payment_id: body?.data?.payment?.id || body?.data?.id } : null,
+    });
+  } catch (_) {}
   if (type !== 'payment.succeeded') {
     return res.status(200).json({ received: true });
   }
@@ -763,29 +814,49 @@ api.post('/webhooks/whop', async (req, res) => {
     return res.status(200).json({ received: true });
   }
   try {
-    const result = await runSplitForPayment(paymentId);
+    const result = await runSplitForPayment(paymentId, user.id);
+    try {
+      await db.insertActivityLog({
+        userId: user.id,
+        email: u?.email,
+        action: 'webhook_split',
+        message: result.ran ? `Split ran for payment ${paymentId}` : `Split skipped: ${result.reason || 'unknown'}`,
+        meta: { payment_id: paymentId, ran: result.ran, reason: result.reason, transfers: result.transfersCreated?.length },
+      });
+    } catch (_) {}
     return res.status(200).json({ received: true, ...result });
   } catch (e) {
     console.error('Webhook split error:', e);
+    try {
+      await db.insertActivityLog({
+        userId: user.id,
+        email: u?.email,
+        action: 'webhook_split_error',
+        message: e?.message || 'Split failed',
+        meta: { payment_id: paymentId },
+      });
+    } catch (_) {}
     return res.status(500).json({ received: true, error: e?.message });
   }
 });
 
-// Process recent payments (catch-up): list paid payments and run split for any not yet processed
+// Process recent payments (catch-up)
 api.post('/process-payments', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop || !getWhopCompanyId()) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({
       error: 'Server not configured',
-      message: 'Set WHOP_API_KEY and WHOP_PARENT_COMPANY_ID in Settings or .env',
+      message: 'Set Whop API key and Company ID in Settings',
     });
   }
-  const state = readAutoSplit();
+  const state = await db.getFullAutoSplit(userId);
   const processed = new Set(state.processedPaymentIds);
   const results = { processed: 0, skipped: 0, errors: [] };
   try {
     const page = await whop.payments.list({
-      company_id: getWhopCompanyId(),
+      company_id: companyId,
       first: 100,
       order: 'paid_at',
       direction: 'desc',
@@ -797,7 +868,7 @@ api.post('/process-payments', requireAuth, async (req, res) => {
         continue;
       }
       try {
-        const result = await runSplitForPayment(p.id);
+        const result = await runSplitForPayment(p.id, userId);
         if (result.ran) results.processed++;
       } catch (e) {
         results.errors.push({ payment_id: p.id, message: e?.message });
@@ -816,13 +887,15 @@ api.post('/process-payments', requireAuth, async (req, res) => {
 
 // List payments (for UI)
 api.get('/payments', requireAuth, async (req, res) => {
-  const whop = getWhop();
-  if (!whop || !getWhopCompanyId()) {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
     return res.status(503).json({ data: [], message: 'Whop not configured' });
   }
   try {
     const page = await whop.payments.list({
-      company_id: getWhopCompanyId(),
+      company_id: companyId,
       first: 50,
       order: 'paid_at',
       direction: 'desc',
@@ -839,7 +912,7 @@ api.get('/payments', requireAuth, async (req, res) => {
       product: p.product ? { id: p.product.id, title: p.product.title } : null,
       plan: p.plan ? { id: p.plan.id } : null,
     }));
-    const state = readAutoSplit();
+    const state = await db.getFullAutoSplit(userId);
     return res.json({
       data,
       processedPaymentIds: state.processedPaymentIds.slice(-500),
@@ -849,6 +922,105 @@ api.get('/payments', requireAuth, async (req, res) => {
       data: [],
       message: err?.message || 'Failed to list payments',
     });
+  }
+});
+
+// ——— Admin (requireAuth + requireAdmin) ———
+api.get('/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const rows = await db.listUsers();
+    const users = rows.map((r) => ({
+      id: r.id,
+      email: r.email,
+      role: r.role,
+      active: Boolean(r.active),
+      created_at: r.created_at,
+    }));
+    return res.json({ data: users });
+  } catch (err) {
+    console.error('Admin users list error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not list users.' });
+  }
+});
+
+api.patch('/admin/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  const targetId = Number(req.params.id);
+  const { role, active } = req.body || {};
+  if (!targetId || isNaN(targetId)) {
+    return res.status(400).json({ error: 'Invalid user id' });
+  }
+  const target = await db.getUserById(targetId);
+  if (!target) {
+    return res.status(404).json({ error: 'Not found', message: 'User not found.' });
+  }
+  const adminUser = getSessionUser(req);
+  if (targetId === adminUser?.id && active === false) {
+    return res.status(400).json({ error: 'Cannot deactivate yourself', message: 'You cannot deactivate your own account.' });
+  }
+  try {
+    if (role === 'admin' || role === 'user') {
+      await db.updateUserRole(targetId, role);
+      await db.insertActivityLog({
+        userId: adminUser?.id,
+        email: adminUser?.email,
+        action: 'admin_role_change',
+        message: `Role set to ${role} for ${target?.email ?? targetId}`,
+        meta: { target_user_id: targetId, new_role: role },
+      });
+    }
+    if (typeof active === 'boolean') {
+      await db.updateUserActive(targetId, active);
+      await db.insertActivityLog({
+        userId: adminUser?.id,
+        email: adminUser?.email,
+        action: active ? 'admin_user_activated' : 'admin_user_deactivated',
+        message: `${target?.email ?? targetId} ${active ? 'activated' : 'deactivated'}`,
+        meta: { target_user_id: targetId },
+      });
+    }
+    const updatedUser = await db.getUserById(targetId);
+    return res.json({
+      ok: true,
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        active: Boolean(updatedUser.active),
+      },
+    });
+  } catch (err) {
+    console.error('Admin user update error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not update user.' });
+  }
+});
+
+api.get('/admin/logs', requireAuth, requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 500);
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const filters = {
+    userId: req.query.user_id != null ? req.query.user_id : undefined,
+    email: req.query.email != null ? String(req.query.email).trim() || undefined : undefined,
+    from: req.query.from != null ? String(req.query.from).trim() || undefined : undefined,
+    to: req.query.to != null ? String(req.query.to).trim() || undefined : undefined,
+    action: req.query.action != null ? String(req.query.action).trim() || undefined : undefined,
+  };
+  try {
+    const logs = await db.getActivityLogs(limit, offset, filters);
+    return res.json({ data: logs });
+  } catch (err) {
+    console.error('Admin logs error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not load logs.' });
+  }
+});
+
+api.get('/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
+  const days = Math.min(Number(req.query.days) || 30, 90);
+  try {
+    const stats = await db.getAnalyticsStats(days);
+    return res.json(stats);
+  } catch (err) {
+    console.error('Admin analytics error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not load analytics.' });
   }
 });
 
@@ -878,16 +1050,27 @@ if (fs.existsSync(clientDist)) {
   console.log('  (No client/dist — run "npm run build" in client/)');
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`Whop Admin running at http://localhost:${PORT}`);
-  console.log(`  Login: http://localhost:${PORT}/login`);
-  console.log(`  Connected accounts (after login): http://localhost:${PORT}/connected-accounts`);
-});
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. Stop the other process or set PORT in .env (e.g. PORT=3002).`);
+async function start() {
+  try {
+    await db.query('SELECT 1');
+    console.log('Database connected');
+  } catch (e) {
+    console.error('Database connection failed:', e?.message);
+    console.error('Set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME and run scripts/init-db.sql');
     process.exit(1);
   }
-  throw err;
-});
+  const server = app.listen(PORT, () => {
+    console.log(`Whop Admin running at http://localhost:${PORT}`);
+    console.log(`  Sign up / Login: http://localhost:${PORT}/login`);
+    console.log(`  After login: http://localhost:${PORT}/connected-accounts`);
+  });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use. Set PORT in .env (e.g. PORT=3002).`);
+      process.exit(1);
+    }
+    throw err;
+  });
+}
+
+start();

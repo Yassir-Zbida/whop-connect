@@ -1,10 +1,15 @@
 import { useState, useEffect } from 'react';
+import { useOutletContext } from 'react-router-dom';
 import { Icon, IconPaths } from '../components/Icon';
 import { getSettings, updateSettings } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 
+type LayoutContext = { user: { id: number; email: string; role?: 'user' | 'admin' } };
+
 export default function Settings() {
+  const { user } = useOutletContext<LayoutContext>();
+  const isAdmin = user?.role === 'admin';
   const [loading, setLoading] = useState(true);
   const [savingWhop, setSavingWhop] = useState(false);
   const [savingPassword, setSavingPassword] = useState(false);
@@ -15,6 +20,7 @@ export default function Settings() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [maskedApiKey, setMaskedApiKey] = useState<string | null>(null);
   const [adminPasswordSet, setAdminPasswordSet] = useState(false);
+  const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
   const [msgWhop, setMsgWhop] = useState<{ text: string; error: boolean } | null>(null);
   const [msgPassword, setMsgPassword] = useState<{ text: string; error: boolean } | null>(null);
   const { showToast } = useToast();
@@ -25,6 +31,7 @@ export default function Settings() {
         setMaskedApiKey(s.whopApiKeyMasked);
         setWhopCompanyId(s.whopCompanyId || '');
         setAdminPasswordSet(s.adminPasswordSet);
+        setWebhookUrl(s.webhookUrl ?? null);
       })
       .catch(() => setMsgWhop({ text: 'Failed to load settings', error: true }))
       .finally(() => setLoading(false));
@@ -46,10 +53,12 @@ export default function Settings() {
       logSuccess('Settings', 'Whop API & Company saved');
       showToast('Whop settings saved');
       setMsgWhop({ text: 'Saved.', error: false });
+      window.dispatchEvent(new CustomEvent('whop-settings-saved'));
       setWhopApiKey('');
       getSettings().then((s) => {
         setMaskedApiKey(s.whopApiKeyMasked);
         setWhopCompanyId(s.whopCompanyId || '');
+        setWebhookUrl(s.webhookUrl ?? null);
       });
     } catch (err) {
       const text = err instanceof Error ? err.message : 'Failed to save';
@@ -122,12 +131,64 @@ export default function Settings() {
     <main className="main">
       <div className="topbar">
         <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span className="topbar-title">Settings</span>
-          <span className="topbar-sub">· Whop API, company ID & dashboard password</span>
+          <span className="topbar-title">{isAdmin ? 'Admin settings' : 'Settings'}</span>
+          <span className="topbar-sub">
+            {isAdmin ? '· Profile, optional Whop API & password' : '· Whop API, company ID & dashboard password'}
+          </span>
         </div>
       </div>
 
       <div className="content settings-grid">
+        {isAdmin && (
+          <div
+            className="card"
+            style={{
+              gridColumn: '1 / -1',
+              background: 'linear-gradient(135deg, var(--accent-dim) 0%, var(--surface-2) 100%)',
+              borderColor: 'var(--accent-border)',
+            }}
+          >
+            <div className="card-body" style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+              <div
+                style={{
+                  width: 48,
+                  height: 48,
+                  borderRadius: 12,
+                  background: 'var(--accent)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'white',
+                  fontWeight: 700,
+                  fontSize: 18,
+                }}
+              >
+                A
+              </div>
+              <div>
+                <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--text)' }}>{user?.email}</div>
+                <span
+                  style={{
+                    display: 'inline-block',
+                    marginTop: 4,
+                    padding: '4px 10px',
+                    borderRadius: 6,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    background: 'var(--accent)',
+                    color: 'white',
+                  }}
+                >
+                  Administrator
+                </span>
+              </div>
+              <p style={{ marginLeft: 'auto', fontSize: 14, color: 'var(--text-2)', maxWidth: 360 }}>
+                You have access to Analytics, Users, and Logs. Below you can change your password and optionally set Whop API for this account.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Left: Whop API & Company */}
         <div className="card">
           <div className="card-header">
@@ -138,7 +199,9 @@ export default function Settings() {
           </div>
           <div className="card-body">
             <p className="card-desc">
-              Set your Whop API key and company ID here instead of editing .env. Leave a field blank to keep its current value.
+              {isAdmin
+                ? 'Optional for your admin account. Set Whop API key and Company ID if you also want to use connected accounts from this login. Leave blank to keep current value.'
+                : 'Set your Whop API key and Company ID here. Both are required to add connected accounts, send funds, and use Auto-split. Leave a field blank to keep its current value.'}
             </p>
             {msgWhop && (
               <div
@@ -185,6 +248,30 @@ export default function Settings() {
                 {savingWhop ? 'Saving…' : 'Save settings'}
               </button>
             </form>
+            {webhookUrl && (
+              <div className="field" style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
+                <label className="field-label">Webhook URL (for Auto-split)</label>
+                <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Use this URL in your Whop dashboard to receive payment.succeeded events.
+                </p>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <code style={{ flex: 1, minWidth: 200, fontSize: 12, wordBreak: 'break-all', padding: 8, background: 'var(--bg-2)', borderRadius: 6 }}>
+                    {webhookUrl}
+                  </code>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ fontSize: 12 }}
+                    onClick={() => {
+                      navigator.clipboard.writeText(webhookUrl);
+                      showToast('Webhook URL copied');
+                    }}
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -193,17 +280,21 @@ export default function Settings() {
           <div className="card-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <Icon d={IconPaths.settings} size={14} />
-              <span className="card-title">Dashboard password</span>
+              <span className="card-title">{isAdmin ? 'Admin account password' : 'Dashboard password'}</span>
             </div>
           </div>
           <div className="card-body">
             {adminPasswordSet ? (
               <p className="card-desc">
-                A password is set. Enter your current password and a new one below to change it.
+                {isAdmin
+                  ? 'Change your admin account password. Enter current password and a new one below.'
+                  : 'A password is set. Enter your current password and a new one below to change it.'}
               </p>
             ) : (
               <p className="card-desc">
-                Set a password for logging into this dashboard. You can change it later here.
+                {isAdmin
+                  ? 'Set a password for this admin account. You can change it later here.'
+                  : 'Set a password for logging into this dashboard. You can change it later here.'}
               </p>
             )}
             {msgPassword && (

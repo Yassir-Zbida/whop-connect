@@ -38,18 +38,27 @@ function getErrorMessage(data: unknown): string {
   return 'Request failed';
 }
 
-export async function getMe(): Promise<{ user: { username: string } } | null> {
+export type User = { id: number; email: string; role?: 'user' | 'admin' };
+
+export async function getMe(): Promise<{ user: User | null } | null> {
   try {
-    return await request<{ user: { username: string } }>('/api/me');
+    return await request<{ user: User | null }>('/api/me');
   } catch {
     return null;
   }
 }
 
-export async function login(username: string, password: string): Promise<{ ok: boolean }> {
-  return request<{ ok: boolean }>('/api/login', {
+export async function register(email: string, password: string): Promise<{ ok: boolean; user: User }> {
+  return request<{ ok: boolean; user: User }>('/api/register', {
     method: 'POST',
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
+  });
+}
+
+export async function login(email: string, password: string): Promise<{ ok: boolean; user: User }> {
+  return request<{ ok: boolean; user: User }>('/api/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
   });
 }
 
@@ -223,6 +232,7 @@ export type Settings = {
   whopApiKeyMasked: string | null;
   whopCompanyId: string | null;
   adminPasswordSet: boolean;
+  webhookUrl?: string | null;
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -238,5 +248,80 @@ export async function updateSettings(body: {
   return request<{ ok: boolean; message?: string }>('/api/settings', {
     method: 'PUT',
     body: JSON.stringify(body),
+  });
+}
+
+// ——— Admin (requires role === 'admin') ———
+export type AdminUser = { id: number; email: string; role: string; active?: boolean; created_at: string };
+
+export async function getAdminUsers(): Promise<{ data: AdminUser[] }> {
+  return request<{ data: AdminUser[] }>('/api/admin/users');
+}
+
+export async function updateUserActive(userId: number, active: boolean): Promise<{ ok: boolean; user: AdminUser }> {
+  return request<{ ok: boolean; user: AdminUser }>(`/api/admin/users/${userId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ active }),
+  });
+}
+
+export type ActivityLogEntry = {
+  id: number;
+  user_id: number | null;
+  email: string | null;
+  action: string;
+  message: string;
+  meta: Record<string, unknown> | null;
+  created_at: string;
+};
+
+export type AdminLogsFilters = {
+  user_id?: number;
+  email?: string;
+  from?: string; // ISO date or datetime
+  to?: string;
+  action?: string;
+};
+
+export type AdminAnalytics = {
+  usersTotal: number;
+  signupsByDay: Array<{ date: string; count: number }>;
+  activityByAction: Array<{ action: string; count: number }>;
+  loginsByDay: Array<{ date: string; count: number }>;
+};
+
+export async function getAdminAnalytics(days?: number): Promise<AdminAnalytics> {
+  const params = days != null ? `?days=${days}` : '';
+  return request<AdminAnalytics>(`/api/admin/analytics${params}`);
+}
+
+export async function getAdminLogs(
+  limit?: number,
+  offset?: number,
+  filters?: AdminLogsFilters
+): Promise<{ data: ActivityLogEntry[] }> {
+  const params = new URLSearchParams();
+  if (limit != null) params.set('limit', String(limit));
+  if (offset != null) params.set('offset', String(offset));
+  if (filters?.user_id != null) params.set('user_id', String(filters.user_id));
+  if (filters?.email?.trim()) params.set('email', filters.email.trim());
+  if (filters?.from?.trim()) params.set('from', filters.from.trim());
+  if (filters?.to?.trim()) params.set('to', filters.to.trim());
+  if (filters?.action?.trim()) params.set('action', filters.action.trim());
+  const q = params.toString();
+  return request<{ data: ActivityLogEntry[] }>(`/api/admin/logs${q ? `?${q}` : ''}`);
+}
+
+export async function updateUserRole(userId: number, role: 'user' | 'admin'): Promise<{ ok: boolean; user: AdminUser }> {
+  return request<{ ok: boolean; user: AdminUser }>(`/api/admin/users/${userId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ role }),
+  });
+}
+
+export async function updateAdminUser(userId: number, data: { role?: 'user' | 'admin'; active?: boolean }): Promise<{ ok: boolean; user: AdminUser }> {
+  return request<{ ok: boolean; user: AdminUser }>(`/api/admin/users/${userId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
   });
 }

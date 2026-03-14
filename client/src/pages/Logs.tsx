@@ -1,51 +1,107 @@
-import { useState, useMemo } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Icon, IconPaths } from '../components/Icon';
-import { useLogs, type LogEntry, type LogLevel } from '../context/LogContext';
+import { getMe, getAdminLogs } from '../api';
+import type { ActivityLogEntry } from '../api';
+import { useToast } from '../context/ToastContext';
 
-const LEVELS: LogLevel[] = ['debug', 'info', 'success', 'error'];
+const PAGE_SIZE = 100;
 
-function formatTime(iso: string) {
+function formatDateTime(iso: string) {
   try {
-    const d = new Date(iso);
-    const time = d.toLocaleTimeString(undefined, {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
+    return new Date(iso).toLocaleString(undefined, {
+      dateStyle: 'short',
+      timeStyle: 'medium',
     });
-    const ms = d.getMilliseconds().toString().padStart(3, '0');
-    return `${time}.${ms}`;
   } catch {
     return iso;
   }
 }
 
 export default function Logs() {
-  const { entries, clearLogs } = useLogs();
-  const [levelFilter, setLevelFilter] = useState<LogLevel | 'all'>('all');
-  const [search, setSearch] = useState('');
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const navigate = useNavigate();
+  const { showToast } = useToast();
+  const [allowed, setAllowed] = useState<boolean | null>(null);
+  const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [expandedId, setExpandedId] = useState<number | null>(null);
 
-  const filtered = useMemo(() => {
-    let list = entries;
-    if (levelFilter !== 'all') {
-      list = list.filter((e) => e.level === levelFilter);
-    }
-    if (search.trim()) {
-      const q = search.trim().toLowerCase();
-      list = list.filter(
-        (e) =>
-          e.action.toLowerCase().includes(q) ||
-          e.message.toLowerCase().includes(q) ||
-          JSON.stringify(e.meta || {}).toLowerCase().includes(q)
-      );
-    }
-    return list;
-  }, [entries, levelFilter, search]);
+  // Filters
+  const [filterUser, setFilterUser] = useState('');
+  const [filterEmail, setFilterEmail] = useState('');
+  const [filterFrom, setFilterFrom] = useState('');
+  const [filterTo, setFilterTo] = useState('');
+  const [filterAction, setFilterAction] = useState('');
+
+  const load = useCallback(
+    (resetOffset = true) => {
+      const off = resetOffset ? 0 : offset;
+      setLoading(true);
+      getAdminLogs(PAGE_SIZE, off, {
+        user_id: filterUser ? Number(filterUser) : undefined,
+        email: filterEmail.trim() || undefined,
+        from: filterFrom.trim() ? `${filterFrom.trim()}T00:00:00.000Z` : undefined,
+        to: filterTo.trim() ? `${filterTo.trim()}T23:59:59.999Z` : undefined,
+        action: filterAction.trim() || undefined,
+      })
+        .then((res) => {
+          const data = res.data || [];
+          if (resetOffset) {
+            setEntries(data);
+            setOffset(data.length);
+          } else {
+            setEntries((prev) => [...prev, ...data]);
+            setOffset((o) => o + data.length);
+          }
+          setHasMore(data.length === PAGE_SIZE);
+        })
+        .catch(() => showToast('Failed to load logs', 'error'))
+        .finally(() => setLoading(false));
+    },
+    [filterUser, filterEmail, filterFrom, filterTo, filterAction, offset, showToast]
+  );
+
+  useEffect(() => {
+    getMe()
+      .then((data) => {
+        if (data?.user?.role !== 'admin') {
+          setAllowed(false);
+          navigate('/', { replace: true });
+        } else {
+          setAllowed(true);
+        }
+      })
+      .catch(() => {
+        setAllowed(false);
+        navigate('/login', { replace: true });
+      });
+  }, [navigate]);
+
+  useEffect(() => {
+    if (!allowed) return;
+    load(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allowed, filterUser, filterEmail, filterFrom, filterTo, filterAction]);
+
+  const applyFilters = () => load(true);
+
+  const loadMore = () => {
+    if (loading || !hasMore) return;
+    load(false);
+  };
 
   const handleExport = () => {
-    const lines = filtered.map((e) =>
-      [e.timestamp, e.level.toUpperCase().padEnd(7), e.action, e.message, e.meta ? JSON.stringify(e.meta) : ''].join('\t')
+    const lines = entries.map((e) =>
+      [
+        e.created_at,
+        e.email ?? '',
+        e.user_id ?? '',
+        e.action,
+        e.message,
+        e.meta ? JSON.stringify(e.meta) : '',
+      ].join('\t')
     );
     const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -54,21 +110,36 @@ export default function Logs() {
     a.download = `app-logs-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.txt`;
     a.click();
     URL.revokeObjectURL(url);
+    showToast('Exported');
   };
 
   const copyAll = () => {
-    const text = filtered
-      .map((e) => `[${e.timestamp}] ${e.level} ${e.action} ${e.message}${e.meta ? ' ' + JSON.stringify(e.meta) : ''}`)
+    const text = entries
+      .map((e) => `[${e.created_at}] ${e.email ?? ''} ${e.action} ${e.message}${e.meta ? ' ' + JSON.stringify(e.meta) : ''}`)
       .join('\n');
     navigator.clipboard.writeText(text);
+    showToast('Copied to clipboard');
   };
+
+  if (allowed === null) {
+    return (
+      <main className="main">
+        <div className="topbar">
+          <span className="topbar-title">App logs</span>
+        </div>
+        <div style={{ padding: 24, color: 'var(--text-2)' }}>Checking access…</div>
+      </main>
+    );
+  }
+
+  if (!allowed) return null;
 
   return (
     <main className="main">
       <div className="topbar">
         <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span className="topbar-title">System logs</span>
-          <span className="topbar-sub">· Debug &amp; monitor</span>
+          <span className="topbar-title">App logs</span>
+          <span className="topbar-sub">· Monitor whole app (admin only)</span>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button className="btn btn-ghost btn-sm" onClick={copyAll} style={{ gap: 6 }}>
@@ -79,55 +150,81 @@ export default function Logs() {
             <Icon d={IconPaths.receipt} size={12} />
             Export
           </button>
-          <button className="btn btn-ghost btn-sm" onClick={clearLogs} style={{ gap: 6, color: 'var(--red)' }}>
-            <Icon d={IconPaths.trash} size={12} />
-            Clear
+          <button className="btn btn-ghost btn-sm" onClick={() => load(true)} style={{ gap: 6 }} disabled={loading}>
+            <Icon d={IconPaths.refresh} size={12} />
+            Refresh
           </button>
         </div>
       </div>
 
       <div className="content">
+        <div className="card" style={{ marginBottom: 24 }}>
+          <div className="card-header">
+            <span className="card-title">Filter logs</span>
+          </div>
+          <div className="card-body">
+            <div className="logs-filter-row">
+              <label className="logs-filter-label">
+                <span className="logs-filter-label-text">User ID</span>
+                <input
+                  type="text"
+                  className="field-input logs-filter-input"
+                  placeholder="e.g. 1"
+                  value={filterUser}
+                  onChange={(e) => setFilterUser(e.target.value)}
+                />
+              </label>
+              <label className="logs-filter-label">
+                <span className="logs-filter-label-text">Email</span>
+                <input
+                  type="text"
+                  className="field-input logs-filter-input"
+                  placeholder="user@example.com"
+                  value={filterEmail}
+                  onChange={(e) => setFilterEmail(e.target.value)}
+                />
+              </label>
+              <label className="logs-filter-label">
+                <span className="logs-filter-label-text">From date</span>
+                <input
+                  type="date"
+                  className="field-input logs-filter-input"
+                  value={filterFrom}
+                  onChange={(e) => setFilterFrom(e.target.value)}
+                />
+              </label>
+              <label className="logs-filter-label">
+                <span className="logs-filter-label-text">To date</span>
+                <input
+                  type="date"
+                  className="field-input logs-filter-input"
+                  value={filterTo}
+                  onChange={(e) => setFilterTo(e.target.value)}
+                />
+              </label>
+              <label className="logs-filter-label">
+                <span className="logs-filter-label-text">Action</span>
+                <input
+                  type="text"
+                  className="field-input logs-filter-input"
+                  placeholder="e.g. login, webhook_received"
+                  value={filterAction}
+                  onChange={(e) => setFilterAction(e.target.value)}
+                />
+              </label>
+              <div className="logs-filter-actions">
+                <button type="button" className="btn btn-primary logs-filter-btn" onClick={applyFilters} disabled={loading}>
+                  Apply filters
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div className="card">
           <div className="card-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <Icon d={IconPaths.terminal} size={14} />
-              <span className="card-title">Log stream</span>
-              <span
-                style={{
-                  background: 'var(--surface-3)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 99,
-                  padding: '3px 10px',
-                  fontSize: 14,
-                  color: 'var(--text-2)',
-                }}
-              >
-                {filtered.length} / {entries.length}
-              </span>
-            </div>
-            <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'nowrap' }}>
-              <select
-                className="select-native"
-                value={levelFilter}
-                onChange={(e) => setLevelFilter(e.target.value as LogLevel | 'all')}
-                style={{ minWidth: 120, flexShrink: 0 }}
-              >
-                <option value="all">All levels</option>
-                {LEVELS.map((l) => (
-                  <option key={l} value={l}>
-                    {l}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="search"
-                className="field-input"
-                placeholder="Search action, message, meta…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                style={{ minWidth: 200, flex: 1 }}
-              />
-            </div>
+            <span className="card-title">Activity log</span>
+            <span style={{ fontSize: 14, color: 'var(--text-2)' }}>{entries.length} rows</span>
           </div>
           <div className="card-body" style={{ padding: 0 }}>
             <div
@@ -142,10 +239,10 @@ export default function Logs() {
               <div style={{ flex: '0 0 140px', fontSize: 12, fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase' }}>
                 Time
               </div>
-              <div style={{ flex: '0 0 72px', fontSize: 12, fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase' }}>
-                Level
+              <div style={{ flex: '0 0 120px', fontSize: 12, fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase' }}>
+                User
               </div>
-              <div style={{ flex: '0 0 100px', fontSize: 12, fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase' }}>
+              <div style={{ flex: '0 0 140px', fontSize: 12, fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase' }}>
                 Action
               </div>
               <div style={{ flex: 1, minWidth: 0, fontSize: 12, fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase' }}>
@@ -153,24 +250,40 @@ export default function Logs() {
               </div>
               <div style={{ flex: '0 0 40px' }} />
             </div>
-            {filtered.length === 0 ? (
+            {loading && entries.length === 0 ? (
               <div className="empty-state">
-                <p>{entries.length === 0 ? 'No logs yet' : 'No logs match the filter'}</p>
-                <p style={{ color: 'var(--text-2)', fontSize: 14 }}>
-                  {entries.length === 0 ? 'Actions and API calls will appear here.' : 'Try changing level or search.'}
-                </p>
+                <p>Loading logs…</p>
+              </div>
+            ) : entries.length === 0 ? (
+              <div className="empty-state">
+                <p>No logs match the filters</p>
+                <p style={{ color: 'var(--text-2)', fontSize: 14 }}>Try changing filters or date range.</p>
               </div>
             ) : (
-              <div style={{ maxHeight: 'calc(100vh - 280px)', overflowY: 'auto' }}>
-                {filtered.map((entry) => (
-                  <LogRow
-                    key={entry.id}
-                    entry={entry}
-                    expanded={expandedId === entry.id}
-                    onToggle={() => setExpandedId((id) => (id === entry.id ? null : entry.id))}
-                  />
-                ))}
-              </div>
+              <>
+                <div style={{ maxHeight: 'calc(100vh - 420px)', overflowY: 'auto' }}>
+                  {entries.map((entry) => (
+                    <LogRow
+                      key={entry.id}
+                      entry={entry}
+                      expanded={expandedId === entry.id}
+                      onToggle={() => setExpandedId((id) => (id === entry.id ? null : entry.id))}
+                    />
+                  ))}
+                </div>
+                {hasMore && (
+                  <div style={{ padding: 16, borderTop: '1px solid var(--border)', textAlign: 'center' }}>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      onClick={loadMore}
+                      disabled={loading}
+                    >
+                      {loading ? 'Loading…' : 'Load more'}
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -184,11 +297,12 @@ function LogRow({
   expanded,
   onToggle,
 }: {
-  entry: LogEntry;
+  entry: ActivityLogEntry;
   expanded: boolean;
   onToggle: () => void;
 }) {
   const hasMeta = entry.meta && Object.keys(entry.meta).length > 0;
+  const userLabel = entry.email ?? (entry.user_id != null ? `#${entry.user_id}` : '—');
   return (
     <div
       className="log-row"
@@ -200,13 +314,15 @@ function LogRow({
     >
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
         <div style={{ flex: '0 0 140px', fontSize: 13, color: 'var(--text-2)', fontVariantNumeric: 'tabular-nums' }}>
-          {formatTime(entry.timestamp)}
+          {formatDateTime(entry.created_at)}
         </div>
-        <div style={{ flex: '0 0 72px' }}>
-          <span className={`log-badge log-badge--${entry.level}`}>{entry.level}</span>
+        <div style={{ flex: '0 0 120px', fontSize: 13, wordBreak: 'break-all' }}>{userLabel}</div>
+        <div style={{ flex: '0 0 140px' }}>
+          <code style={{ fontSize: 12, background: 'var(--surface-3)', padding: '2px 6px', borderRadius: 4 }}>
+            {entry.action}
+          </code>
         </div>
-        <div style={{ flex: '0 0 100px', fontSize: 13, fontWeight: 500 }}>{entry.action}</div>
-        <div style={{ flex: 1, minWidth: 0, fontSize: 13, wordBreak: 'break-word' }}>{entry.message}</div>
+        <div style={{ flex: 1, minWidth: 0, fontSize: 13, wordBreak: 'break-word' }}>{entry.message || '—'}</div>
         <div style={{ flex: '0 0 40px' }}>
           {hasMeta && (
             <button

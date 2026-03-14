@@ -9,6 +9,7 @@ import {
   getProducts,
   getPayments,
   processPayments,
+  getSettings,
   type SplitRule,
   type Product,
 } from '../api';
@@ -52,6 +53,7 @@ export default function AutoSplit() {
   ]);
   const [addLoading, setAddLoading] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
+  const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
   const { showToast } = useToast();
 
   const load = () => {
@@ -62,14 +64,16 @@ export default function AutoSplit() {
       getProducts(),
       getCompanies(),
       getPayments(),
+      getSettings(),
     ])
-      .then(([rulesRes, productsRes, companiesRes, paymentsRes]) => {
+      .then(([rulesRes, productsRes, companiesRes, paymentsRes, settings]) => {
         setEnabled(rulesRes.enabled);
         setRules(rulesRes.rules || []);
         setProducts(productsRes.data || []);
         setCompanies(companiesRes.data || []);
         setPayments(paymentsRes.data || []);
         setProcessedIds(paymentsRes.processedPaymentIds || []);
+        setWebhookUrl(settings?.webhookUrl ?? null);
       })
       .catch((err) => {
         const text = err instanceof Error ? err.message : 'Failed to load';
@@ -281,8 +285,13 @@ export default function AutoSplit() {
                     marginBottom: 16,
                   }}
                 >
-                  {typeof window !== 'undefined' ? `${window.location.origin}/api/webhooks/whop` : 'https://your-domain.com/api/webhooks/whop'}
+                  {webhookUrl ?? (typeof window !== 'undefined' ? `${window.location.origin}/api/webhooks/whop` : 'https://your-domain.com/api/webhooks/whop')}
                 </div>
+                {!webhookUrl && (
+                  <p style={{ marginTop: -8, marginBottom: 16, fontSize: 12, color: 'var(--text-2)' }}>
+                    Complete Whop setup in Settings to get your unique webhook URL (with token) for this account.
+                  </p>
+                )}
                 <h4 style={{ fontSize: 14, marginBottom: 8 }}>2. Requirements</h4>
                 <ul style={{ marginLeft: 20, marginBottom: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
                   <li>
@@ -336,7 +345,7 @@ export default function AutoSplit() {
             <p className="card-desc">
               When a payment is received, a percentage can be sent automatically to one or more connected accounts
               (suppliers) based on the purchased product. Configure rules below and enable the workflow. Optionally
-              register the webhook URL <code style={{ fontSize: 12 }}>/api/webhooks/whop</code> in your Whop dashboard
+              register the webhook URL shown above in your Whop dashboard
               for real-time splits, or use &quot;Process recent payments&quot; to catch up.
             </p>
           </div>
