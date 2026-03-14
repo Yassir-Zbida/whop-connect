@@ -25,7 +25,6 @@ dotenv.config();
 import express from 'express';
 import session from 'express-session';
 import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcrypt';
 import Whop from '@whop/sdk';
 
@@ -33,7 +32,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Trust first proxy (for rate limit IP and secure cookies behind reverse proxy)
+// Trust first proxy (for secure cookies behind reverse proxy)
 if (isProduction) app.set('trust proxy', 1);
 
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
@@ -136,22 +135,6 @@ app.use(
   })
 );
 
-// Rate limiting: strict for login, general for API
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300,
-  message: { error: 'Too many requests. Try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
 // Body parser with size limit to prevent large payloads
 app.use(express.json({ limit: '256kb' }));
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
@@ -189,7 +172,7 @@ api.get('/me', (req, res) => {
   return res.json({ user: req.session?.user ?? null });
 });
 
-api.post('/login', loginLimiter, async (req, res) => {
+api.post('/login', async (req, res) => {
   const { username, password } = req.body || {};
   const u = username != null ? String(username).trim() : '';
   const p = password != null ? String(password) : '';
@@ -870,7 +853,7 @@ api.get('/payments', requireAuth, async (req, res) => {
 });
 
 // Mount API router at /api (all routes above are now under /api/...)
-app.use('/api', apiLimiter, api);
+app.use('/api', api);
 
 // ——— Serve React SPA (only frontend) ———
 const clientDist = path.join(__dirname, 'client', 'dist');
