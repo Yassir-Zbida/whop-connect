@@ -11,6 +11,8 @@ import Transactions from './pages/Transactions';
 import Products from './pages/Products';
 import Members from './pages/Members';
 import AutoSplit from './pages/AutoSplit';
+import AutoTransfer from './pages/AutoTransfer';
+import SimpleTransfer from './pages/SimpleTransfer';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import Admin from './pages/Admin';
@@ -111,7 +113,9 @@ export default function App() {
         <Route path="analytics" element={user?.role === 'admin' ? <Analytics /> : <Navigate to="/" replace />} />
         <Route path="connected-accounts" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <ConnectedAccounts />} />
         <Route path="transactions" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Transactions />} />
+        <Route path="transfer-funds" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <SimpleTransfer />} />
         <Route path="auto-split" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <AutoSplit />} />
+        <Route path="auto-transfer" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <AutoTransfer />} />
         <Route path="products" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Products />} />
         <Route path="members" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Members />} />
         <Route path="logs" element={user?.role === 'admin' ? <Logs /> : <Navigate to="/" replace />} />

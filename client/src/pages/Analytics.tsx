@@ -94,6 +94,30 @@ export default function Analytics() {
   const totalLogins = data?.loginsByDay?.reduce((s, d) => s + d.count, 0) ?? 0;
   const actionLabels = data?.activityByAction?.map((a) => a.action) || [];
   const actionValues = data?.activityByAction?.map((a) => a.count) || [];
+  const appStats = data?.appStats;
+  const transferCreatesByDay = data?.transferCreatesByDay || [];
+  const transferByDayLabels = transferCreatesByDay.map((d) => d.date);
+  const transferByDayValues = transferCreatesByDay.map((d) => d.count);
+
+  // Key actions for "App actions" chart (friendly labels)
+  const KEY_ACTIONS: Record<string, string> = {
+    company_create: 'Connected account',
+    transfer_create: 'Transfer',
+    webhook_split: 'Auto-split run',
+    webhook_auto_transfer: 'Auto-transfer run',
+    split_rule_create: 'Split rule added',
+    auto_transfer_rule_create: 'Auto-transfer rule added',
+    split_rule_delete: 'Split rule deleted',
+    auto_transfer_rule_delete: 'Auto-transfer rule deleted',
+    settings_update: 'Settings update',
+    login: 'Login',
+    register: 'Sign up',
+  };
+  const keyActionData = (data?.activityByAction || [])
+    .filter((a) => KEY_ACTIONS[a.action] != null)
+    .map((a) => ({ label: KEY_ACTIONS[a.action] || a.action, count: a.count }));
+  const keyActionLabels = keyActionData.map((a) => a.label);
+  const keyActionValues = keyActionData.map((a) => a.count);
 
   const barOptions = useMemo(
     () => ({
@@ -182,6 +206,38 @@ export default function Analytics() {
     [actionLabels, actionValues]
   );
 
+  const transferByDayChartData = useMemo(
+    () => ({
+      labels: transferByDayLabels,
+      datasets: [
+        {
+          label: 'Transfers',
+          data: transferByDayValues,
+          backgroundColor: CHART_COLORS[2],
+          borderColor: 'rgba(234, 179, 8, 1)',
+          borderWidth: 1,
+        },
+      ],
+    }),
+    [transferByDayLabels, transferByDayValues]
+  );
+
+  const keyActionsChartData = useMemo(
+    () => ({
+      labels: keyActionLabels,
+      datasets: [
+        {
+          label: 'Count',
+          data: keyActionValues,
+          backgroundColor: keyActionLabels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]),
+          borderWidth: 1,
+          borderColor: keyActionLabels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length].replace('0.85', '1')),
+        },
+      ],
+    }),
+    [keyActionLabels, keyActionValues]
+  );
+
   const doughnutOptions = useMemo(
     () => ({
       responsive: true,
@@ -260,22 +316,34 @@ export default function Analytics() {
             <div
               style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
-                gap: 16,
+                gridTemplateColumns: 'repeat(3, 1fr)',
+                gap: 10,
                 marginBottom: 24,
               }}
             >
-              <div className="card" style={{ padding: 20, textAlign: 'center' }}>
+              <div className="card analytics-stat-card" style={{ padding: 20, textAlign: 'center' }}>
                 <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--accent)' }}>{data.usersTotal}</div>
                 <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4 }}>Total users</div>
               </div>
-              <div className="card" style={{ padding: 20, textAlign: 'center' }}>
+              <div className="card analytics-stat-card" style={{ padding: 20, textAlign: 'center' }}>
                 <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--green)' }}>{totalSignups}</div>
                 <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4 }}>Signups (period)</div>
               </div>
-              <div className="card" style={{ padding: 20, textAlign: 'center' }}>
+              <div className="card analytics-stat-card" style={{ padding: 20, textAlign: 'center' }}>
                 <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--text)' }}>{totalLogins}</div>
                 <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4 }}>Logins (period)</div>
+              </div>
+              <div className="card analytics-stat-card" style={{ padding: 20, textAlign: 'center' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: 'rgba(6, 182, 212, 0.95)' }}>{appStats?.autoSplitRulesTotal ?? 0}</div>
+                <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4 }}>Auto-split rules</div>
+              </div>
+              <div className="card analytics-stat-card" style={{ padding: 20, textAlign: 'center' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: 'rgba(234, 179, 8, 0.95)' }}>{appStats?.autoTransferRulesTotal ?? 0}</div>
+                <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4 }}>Auto-transfer rules</div>
+              </div>
+              <div className="card analytics-stat-card" style={{ padding: 20, textAlign: 'center' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--green)' }}>{appStats?.transferCreatesInPeriod ?? 0}</div>
+                <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4 }}>Transfers (period)</div>
               </div>
             </div>
 
@@ -304,6 +372,44 @@ export default function Analytics() {
                   <div style={{ height: 280 }}>
                     <Line options={barOptions} data={loginsChartData} />
                   </div>
+                </div>
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Icon d={IconPaths.chart} size={14} />
+                    <span className="card-title">Transfers by day</span>
+                  </div>
+                </div>
+                <div className="card-body" style={{ paddingTop: 8 }}>
+                  <div style={{ height: 280 }}>
+                    <Bar options={barOptions} data={transferByDayChartData} />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="card" style={{ marginTop: 24 }}>
+              <div className="card-header">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Icon d={IconPaths.chart} size={14} />
+                  <span className="card-title">Key app actions (period)</span>
+                </div>
+              </div>
+              <div className="card-body" style={{ paddingTop: 8 }}>
+                <div style={{ height: Math.max(220, keyActionLabels.length * 36) }}>
+                  <Bar
+                    options={{
+                      ...barOptions,
+                      indexAxis: 'y' as const,
+                      scales: {
+                        ...barOptions.scales,
+                        x: { ...barOptions.scales?.x, grid: { color: GRID_COLOR }, ticks: { color: TICK_COLOR, font: { size: 12 } } },
+                        y: { ...barOptions.scales?.y, grid: { display: false }, ticks: { color: TICK_COLOR, font: { size: 12 } } },
+                      },
+                    }}
+                    data={keyActionsChartData}
+                  />
                 </div>
               </div>
             </div>

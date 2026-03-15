@@ -248,28 +248,34 @@ export default function Settings() {
                 {savingWhop ? 'Saving…' : 'Save settings'}
               </button>
             </form>
-            {webhookUrl && (
+            {(webhookUrl || import.meta.env?.PROD) && (
               <div className="field" style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
                 <label className="field-label">Webhook URL (for Auto-split)</label>
                 <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 6 }}>
                   Use this URL in your Whop dashboard to receive payment.succeeded events.
                 </p>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <code style={{ flex: 1, minWidth: 200, fontSize: 12, wordBreak: 'break-all', padding: 8, background: 'var(--bg-2)', borderRadius: 6 }}>
-                    {webhookUrl}
-                  </code>
-                  <button
-                    type="button"
-                    className="btn"
-                    style={{ fontSize: 12 }}
-                    onClick={() => {
-                      navigator.clipboard.writeText(webhookUrl);
-                      showToast('Webhook URL copied');
-                    }}
-                  >
-                    Copy
-                  </button>
-                </div>
+                {webhookUrl && !(import.meta.env?.PROD && webhookUrl.includes('localhost')) ? (
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <code style={{ flex: 1, minWidth: 200, fontSize: 12, wordBreak: 'break-all', padding: 8, background: 'var(--bg-2)', borderRadius: 6 }}>
+                      {webhookUrl}
+                    </code>
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ fontSize: 12 }}
+                      onClick={() => {
+                        navigator.clipboard.writeText(webhookUrl);
+                        showToast('Webhook URL copied');
+                      }}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                ) : (
+                  <p style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                    Set <code style={{ background: 'var(--bg-2)', padding: '2px 6px', borderRadius: 4 }}>APP_BASE_URL</code> in your server environment to your production URL (e.g. <code style={{ background: 'var(--bg-2)', padding: '2px 6px', borderRadius: 4 }}>https://yourdomain.com</code>), then refresh. The webhook URL will appear here.
+                  </p>
+                )}
               </div>
             )}
           </div>

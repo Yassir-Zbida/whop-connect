@@ -247,8 +247,8 @@ api.get('/settings', requireAuth, async (req, res) => {
   const masked = key ? (key.slice(0, 8) + '…' + key.slice(-4)) : '';
   const settings = await db.getUserSettings(userId);
   const webhookToken = settings?.webhook_token || null;
-  const baseUrl = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
-  const webhookUrl = webhookToken ? `${baseUrl}/api/webhooks/whop/${webhookToken}` : null;
+  const baseUrl = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'production' ? '' : `http://localhost:${PORT}`);
+  const webhookUrl = webhookToken && baseUrl ? `${baseUrl}/api/webhooks/whop/${webhookToken}` : null;
   return res.json({
     whopApiKeySet: Boolean(key),
     whopCompanyIdSet: Boolean(config.companyId),
@@ -410,7 +410,7 @@ api.post('/transfers', requireAuth, async (req, res) => {
     });
   }
   try {
-    const { amount, currency, destination_id, metadata } = req.body;
+    const { amount, currency, destination_id, metadata, notes } = req.body;
     if (amount == null || !destination_id) {
       return res.status(400).json({
         error: 'Missing required fields',
@@ -424,23 +424,30 @@ api.post('/transfers', requireAuth, async (req, res) => {
         message: 'amount must be a positive number',
       });
     }
+    const destId = String(destination_id).trim();
+    if (!destId) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        message: 'destination_id is required',
+      });
+    }
 
-    const transfer = await whop.transfers.create({
+    const transferPayload = {
       amount: numAmount,
       currency: (currency || 'usd').toLowerCase(),
       origin_id: companyId,
-      destination_id: String(destination_id).trim(),
-      ...(metadata && typeof metadata === 'object' && Object.keys(metadata).length
-        ? { metadata }
-        : {}),
-    });
+      destination_id: destId,
+      ...(metadata && typeof metadata === 'object' && Object.keys(metadata).length ? { metadata } : {}),
+      ...(typeof notes === 'string' && notes.trim().length > 0 ? { notes: notes.trim().slice(0, 50) } : {}),
+    };
+    const transfer = await whop.transfers.create(transferPayload);
 
     const u = await db.getUserById(userId);
     await db.insertActivityLog({
       userId,
       email: u?.email,
       action: 'transfer_create',
-      message: `Transfer ${transfer.amount} ${transfer.currency} to ${destination_id}`,
+      message: `Transfer ${transfer.amount} ${transfer.currency} to ${destId}`,
       meta: { transfer_id: transfer.id },
     });
 
@@ -719,6 +726,75 @@ async function runSplitForPayment(paymentId, userId) {
   return { ran: true, transfersCreated, errors };
 }
 
+// ——— Auto-transfer: on payment match, send % or fixed amount to any destination ———
+async function runAutoTransferForPayment(paymentId, userId) {
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  const state = await db.getFullAutoTransfer(userId);
+  if (state.processedPaymentIds.includes(paymentId)) return { ran: false, reason: 'already_processed' };
+  if (!whop || !companyId) return { ran: false, reason: 'not_configured' };
+  if (!state.enabled || state.rules.length === 0) return { ran: false, reason: 'disabled_or_no_rules' };
+
+  let payment;
+  try {
+    payment = await whop.payments.retrieve(paymentId);
+  } catch (e) {
+    return { ran: false, reason: 'payment_fetch_failed', message: e?.message };
+  }
+
+  if (payment?.status !== 'paid') return { ran: false, reason: 'payment_not_paid', status: payment?.status };
+  const productId = payment?.product?.id ?? null;
+  const planId = payment?.plan?.id ?? null;
+  const amountRaw = payment?.amount_after_fees ?? payment?.total ?? payment?.usd_total ?? 0;
+  const amount = Number(amountRaw);
+  const currency = (payment?.currency || 'usd').toLowerCase();
+  if (!amount || amount <= 0) return { ran: false, reason: 'invalid_amount' };
+
+  const matchingRules = state.rules.filter((r) => {
+    if (r.productId && r.productId !== productId) return false;
+    if (r.planId != null && r.planId !== '' && r.planId !== planId) return false;
+    return true;
+  });
+  if (matchingRules.length === 0) return { ran: false, reason: 'no_matching_rule', productId, planId };
+
+  const transfersCreated = [];
+  const errors = [];
+  for (const rule of matchingRules) {
+    const destId = rule.destination_id?.trim();
+    if (!destId) continue;
+    let transferAmount;
+    if (rule.transfer_type === 'fixed') {
+      transferAmount = Math.min(Number(rule.value) || 0, amount);
+    } else {
+      transferAmount = Math.round((amount * (Number(rule.value) || 0)) / 100 * 100) / 100;
+    }
+    if (!Number.isFinite(transferAmount) || transferAmount < 0.01) continue;
+    try {
+      const transfer = await whop.transfers.create({
+        amount: transferAmount,
+        currency,
+        origin_id: companyId,
+        destination_id: destId,
+        metadata: {
+          payment_id: paymentId,
+          product_id: productId || '',
+          rule_id: rule.id || '',
+          transfer_type: rule.transfer_type,
+          value: rule.value,
+        },
+      });
+      transfersCreated.push({ transfer_id: transfer.id, destination_id: destId, amount: transferAmount, rule_id: rule.id });
+    } catch (e) {
+      errors.push({ destination_id: destId, rule_id: rule.id, message: e?.message || String(e) });
+    }
+  }
+
+  if (transfersCreated.length > 0 || errors.length === 0) {
+    await db.addProcessedPaymentIdAutoTransfer(userId, paymentId);
+  }
+  return { ran: true, transfersCreated, errors };
+}
+
 // Split rules API (protected, per user)
 api.get('/split-rules', requireAuth, async (req, res) => {
   const userId = getUserId(req);
@@ -744,14 +820,22 @@ api.post('/split-rules', requireAuth, async (req, res) => {
   if (!Array.isArray(splits) || splits.length === 0) {
     return res.status(400).json({ error: 'Invalid request', message: 'splits array is required and must not be empty.' });
   }
-  const rule = await db.createAutoSplitRule(userId, {
-    productId: productId?.trim() || null,
-    planId: planId?.trim() || null,
-    splits: splits.map((s) => ({
-      destination_id: String(s.destination_id ?? '').trim(),
-      percentage: Number(s.percentage) || 0,
-    })),
-  });
+  let rule;
+  try {
+    rule = await db.createAutoSplitRule(userId, {
+      productId: productId?.trim() || null,
+      planId: planId?.trim() || null,
+      splits: splits.map((s) => ({
+        destination_id: String(s.destination_id ?? '').trim(),
+        percentage: Number(s.percentage) || 0,
+      })),
+    });
+  } catch (e) {
+    if (e?.code === 'PRODUCT_IN_AUTO_TRANSFER') {
+      return res.status(409).json({ error: 'Conflict', message: e.message, code: e.code });
+    }
+    throw e;
+  }
   if (!rule || !rule.splits?.length) {
     return res.status(400).json({ error: 'Invalid request', message: 'At least one split with destination_id and percentage is required.' });
   }
@@ -784,6 +868,136 @@ api.delete('/split-rules/:id', requireAuth, async (req, res) => {
   return res.json({ ok: true, rules });
 });
 
+// ——— Auto-transfer API (protected, per user) ———
+api.get('/auto-transfer', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  try {
+    const state = await db.getFullAutoTransfer(userId);
+    return res.json({
+      enabled: state.enabled,
+      rules: state.rules,
+      processedPaymentIds: (state.processedPaymentIds || []).slice(-500),
+    });
+  } catch (e) {
+    console.error('GET /api/auto-transfer failed (run migrate-auto-transfer.sql if tables are missing):', e?.message);
+    return res.json({
+      enabled: false,
+      rules: [],
+      processedPaymentIds: [],
+    });
+  }
+});
+
+api.patch('/auto-transfer', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const { enabled } = req.body ?? {};
+  if (typeof enabled === 'boolean') {
+    await db.setAutoTransferEnabled(userId, enabled);
+  }
+  const config = await db.getAutoTransferConfig(userId);
+  const rules = await db.getAutoTransferRules(userId);
+  return res.json({ enabled: config.enabled, rules });
+});
+
+api.post('/auto-transfer/rules', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const { productId, planId, destination_id, transfer_type, value } = req.body ?? {};
+  const destId = String(destination_id ?? '').trim();
+  if (!destId) {
+    return res.status(400).json({ error: 'Invalid request', message: 'destination_id is required.' });
+  }
+  let rule;
+  try {
+    rule = await db.createAutoTransferRule(userId, {
+      productId: productId?.trim() || null,
+      planId: planId?.trim() || null,
+      destination_id: destId,
+      transfer_type: transfer_type === 'fixed' ? 'fixed' : 'percentage',
+      value: Number(value) || 0,
+    });
+  } catch (e) {
+    if (e?.code === 'PRODUCT_IN_AUTO_SPLIT') {
+      return res.status(409).json({ error: 'Conflict', message: e.message, code: e.code });
+    }
+    throw e;
+  }
+  if (!rule) {
+    return res.status(400).json({ error: 'Invalid request', message: 'value must be a positive number (and ≤ 100 for percentage).' });
+  }
+  const u = await db.getUserById(userId);
+  await db.insertActivityLog({
+    userId,
+    email: u?.email,
+    action: 'auto_transfer_rule_create',
+    message: 'Auto-transfer rule created',
+    meta: { rule_id: rule.id },
+  });
+  return res.status(201).json(rule);
+});
+
+api.delete('/auto-transfer/rules/:id', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const deleted = await db.deleteAutoTransferRule(req.params.id, userId);
+  if (!deleted) {
+    return res.status(404).json({ error: 'Not found', message: 'Rule not found.' });
+  }
+  const u = await db.getUserById(userId);
+  await db.insertActivityLog({
+    userId,
+    email: u?.email,
+    action: 'auto_transfer_rule_delete',
+    message: 'Auto-transfer rule deleted',
+    meta: { rule_id: req.params.id },
+  });
+  const rules = await db.getAutoTransferRules(userId);
+  return res.json({ ok: true, rules });
+});
+
+// Process recent payments for auto-transfer (catch-up)
+api.post('/process-payments-auto-transfer', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
+    return res.status(503).json({
+      error: 'Server not configured',
+      message: 'Set Whop API key and Company ID in Settings',
+    });
+  }
+  const state = await db.getFullAutoTransfer(userId);
+  const processed = new Set(state.processedPaymentIds);
+  const results = { processed: 0, skipped: 0, errors: [] };
+  try {
+    const page = await whop.payments.list({
+      company_id: companyId,
+      first: 100,
+      order: 'paid_at',
+      direction: 'desc',
+    });
+    const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
+    for (const p of items) {
+      if (p.status !== 'paid' || processed.has(p.id)) {
+        results.skipped++;
+        continue;
+      }
+      try {
+        const result = await runAutoTransferForPayment(p.id, userId);
+        if (result.ran) results.processed++;
+      } catch (e) {
+        results.errors.push({ payment_id: p.id, message: e?.message });
+      }
+    }
+    return res.json(results);
+  } catch (err) {
+    const message = err?.message || err?.toString?.() || 'Failed to list payments';
+    return res.status(500).json({
+      error: 'Whop API error',
+      message,
+      ...results,
+    });
+  }
+});
+
 // Webhook: Whop payment.succeeded — URL includes user's token so we know which account to run split for
 api.post('/webhooks/whop/:token', async (req, res) => {
   const token = req.params.token;
@@ -814,17 +1028,30 @@ api.post('/webhooks/whop/:token', async (req, res) => {
     return res.status(200).json({ received: true });
   }
   try {
-    const result = await runSplitForPayment(paymentId, user.id);
+    const splitResult = await runSplitForPayment(paymentId, user.id);
     try {
       await db.insertActivityLog({
         userId: user.id,
         email: u?.email,
         action: 'webhook_split',
-        message: result.ran ? `Split ran for payment ${paymentId}` : `Split skipped: ${result.reason || 'unknown'}`,
-        meta: { payment_id: paymentId, ran: result.ran, reason: result.reason, transfers: result.transfersCreated?.length },
+        message: splitResult.ran ? `Split ran for payment ${paymentId}` : `Split skipped: ${splitResult.reason || 'unknown'}`,
+        meta: { payment_id: paymentId, ran: splitResult.ran, reason: splitResult.reason, transfers: splitResult.transfersCreated?.length },
       });
     } catch (_) {}
-    return res.status(200).json({ received: true, ...result });
+    let autoTransferResult = { ran: false };
+    try {
+      autoTransferResult = await runAutoTransferForPayment(paymentId, user.id);
+      if (autoTransferResult.ran && (autoTransferResult.transfersCreated?.length || autoTransferResult.errors?.length)) {
+        await db.insertActivityLog({
+          userId: user.id,
+          email: u?.email,
+          action: 'webhook_auto_transfer',
+          message: `Auto-transfer ran for payment ${paymentId}`,
+          meta: { payment_id: paymentId, transfers: autoTransferResult.transfersCreated?.length, errors: autoTransferResult.errors?.length },
+        });
+      }
+    } catch (_) {}
+    return res.status(200).json({ received: true, split: splitResult, autoTransfer: autoTransferResult });
   } catch (e) {
     console.error('Webhook split error:', e);
     try {

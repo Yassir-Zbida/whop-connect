@@ -161,7 +161,13 @@ export type Member = {
   } | null;
 };
 
-export async function createTransfer(body: { amount: number; currency?: string; destination_id: string; metadata?: { order_id?: string } }): Promise<{ id: string }> {
+export async function createTransfer(body: {
+  amount: number;
+  currency?: string;
+  destination_id: string;
+  metadata?: { order_id?: string };
+  notes?: string;
+}): Promise<{ id: string }> {
   return request<{ id: string }>('/api/transfers', { method: 'POST', body: JSON.stringify(body) });
 }
 
@@ -221,6 +227,59 @@ export async function getPayments(): Promise<{
 export async function processPayments(): Promise<{ processed: number; skipped: number; errors: Array<{ payment_id: string; message: string }> }> {
   return request<{ processed: number; skipped: number; errors: Array<{ payment_id: string; message: string }> }>(
     '/api/process-payments',
+    { method: 'POST' }
+  );
+}
+
+// ——— Auto-transfer workflow ———
+export type AutoTransferRule = {
+  id: string;
+  productId: string | null;
+  planId: string | null;
+  destination_id: string;
+  transfer_type: 'percentage' | 'fixed';
+  value: number;
+  createdAt: string;
+};
+
+export async function getAutoTransfer(): Promise<{
+  enabled: boolean;
+  rules: AutoTransferRule[];
+  processedPaymentIds: string[];
+}> {
+  return request<{ enabled: boolean; rules: AutoTransferRule[]; processedPaymentIds: string[] }>('/api/auto-transfer');
+}
+
+export async function updateAutoTransferEnabled(enabled: boolean): Promise<{ enabled: boolean; rules: AutoTransferRule[] }> {
+  return request<{ enabled: boolean; rules: AutoTransferRule[] }>('/api/auto-transfer', {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export async function createAutoTransferRule(body: {
+  productId?: string | null;
+  planId?: string | null;
+  destination_id: string;
+  transfer_type: 'percentage' | 'fixed';
+  value: number;
+}): Promise<AutoTransferRule> {
+  return request<AutoTransferRule>('/api/auto-transfer/rules', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export async function deleteAutoTransferRule(id: string): Promise<{ ok: boolean; rules: AutoTransferRule[] }> {
+  return request<{ ok: boolean; rules: AutoTransferRule[] }>(`/api/auto-transfer/rules/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function processPaymentsAutoTransfer(): Promise<{
+  processed: number;
+  skipped: number;
+  errors: Array<{ payment_id: string; message: string }>;
+}> {
+  return request<{ processed: number; skipped: number; errors: Array<{ payment_id: string; message: string }> }>(
+    '/api/process-payments-auto-transfer',
     { method: 'POST' }
   );
 }
@@ -288,6 +347,13 @@ export type AdminAnalytics = {
   signupsByDay: Array<{ date: string; count: number }>;
   activityByAction: Array<{ action: string; count: number }>;
   loginsByDay: Array<{ date: string; count: number }>;
+  appStats?: {
+    connectedAccountsTotal: number;
+    autoSplitRulesTotal: number;
+    autoTransferRulesTotal: number;
+    transferCreatesInPeriod: number;
+  };
+  transferCreatesByDay?: Array<{ date: string; count: number }>;
 };
 
 export async function getAdminAnalytics(days?: number): Promise<AdminAnalytics> {

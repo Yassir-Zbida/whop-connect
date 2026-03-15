@@ -111,11 +111,23 @@ export default function DashboardLayout({ user, onLogout }: Props) {
                 </span>
                 Transactions
               </NavLink>
+              <NavLink to="/transfer-funds" className={navClass}>
+                <span className="nav-icon">
+                  <Icon d={IconPaths.send} size={14} />
+                </span>
+                Transfer funds
+              </NavLink>
               <NavLink to="/auto-split" className={navClass}>
                 <span className="nav-icon">
                   <Icon d={IconPaths.zap} size={14} />
                 </span>
                 Auto-split
+              </NavLink>
+              <NavLink to="/auto-transfer" className={navClass}>
+                <span className="nav-icon">
+                  <Icon d={IconPaths.send} size={14} />
+                </span>
+                Auto transfer
               </NavLink>
               <NavLink to="/products" className={navClass}>
                 <span className="nav-icon">

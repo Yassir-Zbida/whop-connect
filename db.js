@@ -131,7 +131,7 @@ export async function getActivityLogs(limit = 200, offset = 0, filters = {}) {
   }));
 }
 
-/** Analytics: users count, signups by day, activity by action (last N days). */
+/** Analytics: users count, signups by day, activity by action, app-wide stats (last N days). */
 export async function getAnalyticsStats(days = 30) {
   const [usersCount] = await query('SELECT COUNT(*) AS total FROM users');
   const signupsByDay = await query(
@@ -146,11 +146,46 @@ export async function getAnalyticsStats(days = 30) {
     `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM activity_log WHERE action = 'login' AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) GROUP BY DATE(created_at) ORDER BY date ASC`,
     [days]
   );
+  let connectedAccountsTotal = 0;
+  let autoSplitRulesTotal = 0;
+  let autoTransferRulesTotal = 0;
+  let transferCreatesInPeriod = 0;
+  let transferCreatesByDay = [];
+  try {
+    const [ca] = await query('SELECT COUNT(*) AS total FROM connected_accounts');
+    connectedAccountsTotal = ca?.total ?? 0;
+  } catch (_) {}
+  try {
+    const [asr] = await query('SELECT COUNT(*) AS total FROM auto_split_rules');
+    autoSplitRulesTotal = asr?.total ?? 0;
+  } catch (_) {}
+  try {
+    const [atr] = await query('SELECT COUNT(*) AS total FROM auto_transfer_rules');
+    autoTransferRulesTotal = atr?.total ?? 0;
+  } catch (_) {}
+  try {
+    const [tc] = await query(
+      `SELECT COUNT(*) AS total FROM activity_log WHERE action = 'transfer_create' AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
+      [days]
+    );
+    transferCreatesInPeriod = tc?.total ?? 0;
+    transferCreatesByDay = await query(
+      `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM activity_log WHERE action = 'transfer_create' AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) GROUP BY DATE(created_at) ORDER BY date ASC`,
+      [days]
+    );
+  } catch (_) {}
   return {
     usersTotal: usersCount?.total ?? 0,
     signupsByDay: signupsByDay || [],
     activityByAction: activityByAction || [],
     loginsByDay: loginsByDay || [],
+    appStats: {
+      connectedAccountsTotal,
+      autoSplitRulesTotal,
+      autoTransferRulesTotal,
+      transferCreatesInPeriod,
+    },
+    transferCreatesByDay: transferCreatesByDay || [],
   };
 }
 
@@ -294,6 +329,7 @@ export async function createAutoSplitRule(userId, { productId, planId, splits })
     return dest && pct > 0;
   });
   if (!validSplits.length) return null;
+  await assertProductNotInAutoTransfer(userId, productId);
   const id = 'rule_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
   const p = getPool();
   await p.execute(
@@ -339,5 +375,156 @@ export async function setAutoSplitProcessedIds(userId, ids) {
      VALUES (?, 0, ?)
      ON DUPLICATE KEY UPDATE processed_payment_ids = VALUES(processed_payment_ids)`,
     [userId, JSON.stringify(arr)]
+  );
+}
+
+// ——— Auto-transfer config and rules ———
+export async function getAutoTransferConfig(userId) {
+  const rows = await query(
+    'SELECT enabled, processed_payment_ids FROM auto_transfer_config WHERE user_id = ? LIMIT 1',
+    [userId]
+  );
+  if (!rows[0]) return { enabled: false, processedPaymentIds: [] };
+  let ids = rows[0].processed_payment_ids;
+  if (typeof ids === 'string') {
+    try {
+      ids = JSON.parse(ids);
+    } catch {
+      ids = [];
+    }
+  }
+  return {
+    enabled: Boolean(rows[0].enabled),
+    processedPaymentIds: Array.isArray(ids) ? ids : [],
+  };
+}
+
+export async function setAutoTransferEnabled(userId, enabled) {
+  const p = getPool();
+  await p.execute(
+    `INSERT INTO auto_transfer_config (user_id, enabled, processed_payment_ids)
+     VALUES (?, ?, '[]')
+     ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)`,
+    [userId, enabled ? 1 : 0]
+  );
+}
+
+export async function getAutoTransferRules(userId) {
+  const rules = await query(
+    `SELECT id, product_id AS productId, plan_id AS planId, destination_id AS destinationId,
+            transfer_type AS transferType, value, created_at AS createdAt
+     FROM auto_transfer_rules
+     WHERE user_id = ?
+     ORDER BY created_at ASC`,
+    [userId]
+  );
+  return rules.map((r) => ({
+    id: r.id,
+    productId: r.productId || null,
+    planId: r.planId || null,
+    destination_id: r.destinationId,
+    transfer_type: r.transferType || 'percentage',
+    value: Number(r.value),
+    createdAt: r.createdAt,
+  }));
+}
+
+export async function getFullAutoTransfer(userId) {
+  const config = await getAutoTransferConfig(userId);
+  const rules = await getAutoTransferRules(userId);
+  return {
+    enabled: config.enabled,
+    rules,
+    processedPaymentIds: config.processedPaymentIds,
+  };
+}
+
+/** Throw if this product is already used in auto-split (mutual exclusivity). */
+async function assertProductNotInAutoSplit(userId, productId) {
+  const rows = await query(
+    'SELECT product_id FROM auto_split_rules WHERE user_id = ?',
+    [userId]
+  );
+  const normalizedNew = (productId && String(productId).trim()) || null;
+  for (const r of rows) {
+    const existing = r.product_id ?? null;
+    if (existing === normalizedNew) {
+      const err = new Error('This product is already linked to Auto-split. A product can only be in Auto-split or Auto-transfer, not both.');
+      err.code = 'PRODUCT_IN_AUTO_SPLIT';
+      throw err;
+    }
+    if (existing === null) {
+      const err = new Error('"Any product" is already used in Auto-split. A product can only be in Auto-split or Auto-transfer, not both.');
+      err.code = 'PRODUCT_IN_AUTO_SPLIT';
+      throw err;
+    }
+  }
+  if (normalizedNew === null && rows.length > 0) {
+    const err = new Error('Cannot add "Any product" while you have Auto-split rules. A product can only be in Auto-split or Auto-transfer, not both.');
+    err.code = 'PRODUCT_IN_AUTO_SPLIT';
+    throw err;
+  }
+}
+
+/** Throw if this product is already used in auto-transfer (mutual exclusivity). */
+async function assertProductNotInAutoTransfer(userId, productId) {
+  const rows = await query(
+    'SELECT product_id FROM auto_transfer_rules WHERE user_id = ?',
+    [userId]
+  );
+  const normalizedNew = (productId && String(productId).trim()) || null;
+  for (const r of rows) {
+    const existing = r.product_id ?? null;
+    if (existing === normalizedNew) {
+      const err = new Error('This product is already linked to Auto-transfer. A product can only be in Auto-split or Auto-transfer, not both.');
+      err.code = 'PRODUCT_IN_AUTO_TRANSFER';
+      throw err;
+    }
+    if (existing === null) {
+      const err = new Error('"Any product" is already used in Auto-transfer. A product can only be in Auto-split or Auto-transfer, not both.');
+      err.code = 'PRODUCT_IN_AUTO_TRANSFER';
+      throw err;
+    }
+  }
+  if (normalizedNew === null && rows.length > 0) {
+    const err = new Error('Cannot add "Any product" while you have Auto-transfer rules. A product can only be in Auto-split or Auto-transfer, not both.');
+    err.code = 'PRODUCT_IN_AUTO_TRANSFER';
+    throw err;
+  }
+}
+
+export async function createAutoTransferRule(userId, { productId, planId, destination_id, transfer_type, value }) {
+  const destId = String(destination_id ?? '').trim();
+  if (!destId) return null;
+  const typeVal = transfer_type === 'fixed' ? 'fixed' : 'percentage';
+  const numVal = Number(value);
+  if (!Number.isFinite(numVal) || numVal <= 0) return null;
+  if (typeVal === 'percentage' && numVal > 100) return null;
+  await assertProductNotInAutoSplit(userId, productId);
+  const id = 'atr_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
+  await getPool().execute(
+    'INSERT INTO auto_transfer_rules (id, user_id, product_id, plan_id, destination_id, transfer_type, value) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [id, userId, productId?.trim() || null, planId?.trim() || null, destId, typeVal, numVal]
+  );
+  const rules = await getAutoTransferRules(userId);
+  return rules.find((r) => r.id === id) || { id, productId: productId || null, planId: planId || null, destination_id: destId, transfer_type: typeVal, value: numVal, createdAt: new Date().toISOString() };
+}
+
+export async function deleteAutoTransferRule(ruleId, userId) {
+  const [result] = await getPool().execute(
+    'DELETE FROM auto_transfer_rules WHERE id = ? AND user_id = ?',
+    [ruleId, userId]
+  );
+  return result.affectedRows > 0;
+}
+
+export async function addProcessedPaymentIdAutoTransfer(userId, paymentId) {
+  const config = await getAutoTransferConfig(userId);
+  const ids = [...config.processedPaymentIds, paymentId].slice(-MAX_PROCESSED_IDS);
+  await getPool().execute(
+    `INSERT INTO auto_transfer_config (user_id, enabled, processed_payment_ids)
+     VALUES (?, 0, ?)
+     ON DUPLICATE KEY UPDATE processed_payment_ids = VALUES(processed_payment_ids)`,
+    [userId, JSON.stringify(ids)]
   );
 }

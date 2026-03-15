@@ -218,13 +218,18 @@ body {
   border-color: rgba(239,68,68,0.5);
 }
 .btn-danger-ghost {
-  color: #fca5a5;
-  border-color: rgba(239,68,68,0.3);
+  background: transparent;
+  color: #e8797a;
+  border: 1px solid rgba(231, 121, 122, 0.35);
+}
+.btn-danger-ghost:disabled {
+  color: rgba(231, 121, 122, 0.5);
+  border-color: rgba(231, 121, 122, 0.2);
 }
 .btn-danger-ghost:not(:disabled):hover {
-  background: var(--red-dim);
-  color: #fca5a5;
-  border-color: rgba(239,68,68,0.4);
+  background: rgba(239, 68, 68, 0.12);
+  color: #f19a9b;
+  border-color: rgba(231, 121, 122, 0.5);
 }
 
 .alert {
@@ -369,6 +374,16 @@ body {
   margin-bottom: 20px;
   box-shadow: var(--shadow);
   overflow: hidden;
+}
+.analytics-stat-card {
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.04);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  margin-bottom: 0;
+}
+.analytics-stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.06);
 }
 .card-header {
   display: flex;

@@ -1,23 +1,20 @@
 import { useState, useEffect } from 'react';
 import { Icon, IconPaths } from '../components/Icon';
 import {
-  getSplitRules,
   getAutoTransfer,
-  updateSplitRulesEnabled,
-  createSplitRule,
-  deleteSplitRule,
-  getCompanies,
+  getSplitRules,
+  updateAutoTransferEnabled,
+  createAutoTransferRule,
+  deleteAutoTransferRule,
+  processPaymentsAutoTransfer,
   getProducts,
   getPayments,
-  processPayments,
   getSettings,
-  type SplitRule,
+  type AutoTransferRule,
   type Product,
 } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
-
-type Company = { id: string; title?: string; owner_user?: { username?: string } };
 
 function formatDate(iso: string | null | undefined) {
   if (!iso) return '—';
@@ -35,54 +32,52 @@ function formatCurrency(amount: number, currency: string) {
   }).format(amount);
 }
 
-export default function AutoSplit() {
+export default function AutoTransfer() {
   const [enabled, setEnabled] = useState(false);
-  const [rules, setRules] = useState<SplitRule[]>([]);
+  const [rules, setRules] = useState<AutoTransferRule[]>([]);
+  const [processedIds, setProcessedIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [products, setProducts] = useState<Product[]>([]);
-  const [companies, setCompanies] = useState<Company[]>([]);
   const [payments, setPayments] = useState<Array<{ id: string; status: string; amount_after_fees: number; total: number | null; currency: string; paid_at: string | null; created_at: string; product: { id: string; title?: string } | null; plan: { id: string } | null }>>([]);
-  const [processedIds, setProcessedIds] = useState<string[]>([]);
   const [msg, setMsg] = useState<{ text: string; error: boolean } | null>(null);
   const [processing, setProcessing] = useState(false);
-
-  // Add rule form
   const [addProductId, setAddProductId] = useState('');
   const [addPlanId, setAddPlanId] = useState('');
-  const [addSplits, setAddSplits] = useState<Array<{ destination_id: string; percentage: string }>>([
-    { destination_id: '', percentage: '' },
-  ]);
+  const [addDestinationId, setAddDestinationId] = useState('');
+  const [addType, setAddType] = useState<'percentage' | 'fixed'>('percentage');
+  const [addValue, setAddValue] = useState('');
   const [addLoading, setAddLoading] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
   const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
-  const [productIdsInAutoTransfer, setProductIdsInAutoTransfer] = useState<Set<string>>(new Set());
+  const [productIdsInAutoSplit, setProductIdsInAutoSplit] = useState<Set<string>>(new Set());
   const { showToast } = useToast();
 
   const load = () => {
     setLoading(true);
     setMsg(null);
     Promise.all([
-      getSplitRules(),
-      getAutoTransfer().catch(() => ({ enabled: false, rules: [], processedPaymentIds: [] })),
+      getAutoTransfer().catch((err) => {
+        logError('Auto-transfer load', err instanceof Error ? err.message : 'Failed to load');
+        return { enabled: false, rules: [], processedPaymentIds: [] };
+      }),
+      getSplitRules().catch(() => ({ enabled: false, rules: [] })),
       getProducts(),
-      getCompanies(),
       getPayments(),
       getSettings(),
     ])
-      .then(([rulesRes, atRes, productsRes, companiesRes, paymentsRes, settings]) => {
-        setEnabled(rulesRes.enabled);
-        setRules(rulesRes.rules || []);
+      .then(([atRes, splitRes, productsRes, paymentsRes, settings]) => {
+        setEnabled(atRes.enabled);
+        setRules(atRes.rules || []);
+        setProcessedIds(atRes.processedPaymentIds || []);
         setProducts(productsRes.data || []);
-        setCompanies(companiesRes.data || []);
         setPayments(paymentsRes.data || []);
-        setProcessedIds(paymentsRes.processedPaymentIds || []);
         setWebhookUrl(settings?.webhookUrl ?? null);
-        setProductIdsInAutoTransfer(new Set((atRes.rules || []).map((r) => r.productId ?? '__any__')));
+        setProductIdsInAutoSplit(new Set((splitRes.rules || []).map((r) => r.productId ?? '__any__')));
       })
       .catch((err) => {
         const text = err instanceof Error ? err.message : 'Failed to load';
         setMsg({ text, error: true });
-        logError('Auto-split load', text);
+        logError('Auto-transfer load', text);
         showToast(text, 'error');
       })
       .finally(() => setLoading(false));
@@ -94,18 +89,18 @@ export default function AutoSplit() {
 
   const handleToggleEnabled = () => {
     setProcessing(true);
-    updateSplitRulesEnabled(!enabled)
+    updateAutoTransferEnabled(!enabled)
       .then((res) => {
         setEnabled(res.enabled);
-        const text = res.enabled ? 'Auto-split enabled.' : 'Auto-split disabled.';
+        const text = res.enabled ? 'Auto-transfer enabled.' : 'Auto-transfer disabled.';
         setMsg({ text, error: false });
-        logSuccess('Auto-split toggle', text, { enabled: res.enabled });
+        logSuccess('Auto-transfer toggle', text, { enabled: res.enabled });
         showToast(text);
       })
       .catch((err) => {
         const text = err instanceof Error ? err.message : 'Failed to update';
         setMsg({ text, error: true });
-        logError('Auto-split toggle', text);
+        logError('Auto-transfer toggle', text);
         showToast(text, 'error');
       })
       .finally(() => setProcessing(false));
@@ -114,81 +109,74 @@ export default function AutoSplit() {
   const handleProcessPayments = () => {
     setProcessing(true);
     setMsg(null);
-    processPayments()
+    processPaymentsAutoTransfer()
       .then((res) => {
         const text = `Processed ${res.processed} payment(s), skipped ${res.skipped}.${res.errors?.length ? ` ${res.errors.length} error(s).` : ''}`;
         setMsg({ text, error: res.errors?.length > 0 });
-        if (res.errors?.length) logError('Process payments', text, { processed: res.processed, skipped: res.skipped, errors: res.errors });
-        else logSuccess('Process payments', text, { processed: res.processed, skipped: res.skipped });
+        if (res.errors?.length) logError('Process payments (auto-transfer)', text, { errors: res.errors });
+        else logSuccess('Process payments (auto-transfer)', text, { processed: res.processed, skipped: res.skipped });
         showToast(text, res.errors?.length ? 'error' : 'success');
         load();
       })
       .catch((err) => {
         const text = err instanceof Error ? err.message : 'Failed to process payments';
         setMsg({ text, error: true });
-        logError('Process payments', text);
+        logError('Process payments (auto-transfer)', text);
         showToast(text, 'error');
       })
       .finally(() => setProcessing(false));
   };
 
-  const addSplitRow = () => {
-    setAddSplits((prev) => [...prev, { destination_id: '', percentage: '' }]);
-  };
-
-  const updateSplitRow = (index: number, field: 'destination_id' | 'percentage', value: string) => {
-    setAddSplits((prev) => {
-      const next = [...prev];
-      next[index] = { ...next[index], [field]: value };
-      return next;
-    });
-  };
-
-  const removeSplitRow = (index: number) => {
-    setAddSplits((prev) => prev.filter((_, i) => i !== index));
-  };
-
   const handleAddRule = async (e: React.FormEvent) => {
     e.preventDefault();
     setMsg(null);
+    const destId = addDestinationId.trim();
+    const numVal = parseFloat(addValue);
     const productKey = addProductId.trim() || '__any__';
-    if (productIdsInAutoTransfer.has(productKey)) {
-      const text = 'This product is linked to Auto-transfer. A product can only be in Auto-split or Auto-transfer, not both.';
-      setMsg({ text, error: true });
-      showToast('Product is linked to Auto-transfer', 'error');
+    if (productIdsInAutoSplit.has(productKey)) {
+      setMsg({
+        text: 'This product is linked to Auto-split. A product can only be in Auto-split or Auto-transfer, not both.',
+        error: true,
+      });
+      showToast('Product is linked to Auto-split', 'error');
       return;
     }
-    const splits = addSplits
-      .map((s) => ({
-        destination_id: s.destination_id.trim(),
-        percentage: parseFloat(s.percentage) || 0,
-      }))
-      .filter((s) => s.destination_id && s.percentage > 0);
-    if (splits.length === 0) {
-      const text = 'Add at least one destination with a percentage.';
-      setMsg({ text, error: true });
-      logError('Add split rule', text);
-      showToast(text, 'error');
+    if (!destId) {
+      setMsg({ text: 'Destination ID is required (user_xxx, biz_xxx, or ldgr_xxx).', error: true });
+      showToast('Destination ID is required', 'error');
+      return;
+    }
+    if (!Number.isFinite(numVal) || numVal <= 0) {
+      setMsg({ text: 'Enter a valid positive value.', error: true });
+      showToast('Enter a valid positive value', 'error');
+      return;
+    }
+    if (addType === 'percentage' && numVal > 100) {
+      setMsg({ text: 'Percentage cannot exceed 100.', error: true });
+      showToast('Percentage cannot exceed 100', 'error');
       return;
     }
     setAddLoading(true);
     try {
-      await createSplitRule({
+      await createAutoTransferRule({
         productId: addProductId.trim() || null,
         planId: addPlanId.trim() || null,
-        splits,
+        destination_id: destId,
+        transfer_type: addType,
+        value: numVal,
       });
       setMsg({ text: 'Rule added.', error: false });
-      logSuccess('Add split rule', 'Rule added.', { productId: addProductId || null, splitsCount: splits.length });
+      logSuccess('Add auto-transfer rule', 'Rule added.', { destination_id: destId });
       showToast('Rule added.');
       setAddProductId('');
       setAddPlanId('');
-      setAddSplits([{ destination_id: '', percentage: '' }]);
+      setAddDestinationId('');
+      setAddValue('');
       load();
     } catch (err) {
       const text = err instanceof Error ? err.message : 'Failed to add rule';
       setMsg({ text, error: true });
-      logError('Add split rule', text);
+      logError('Add auto-transfer rule', text);
       showToast(text, 'error');
     } finally {
       setAddLoading(false);
@@ -196,93 +184,67 @@ export default function AutoSplit() {
   };
 
   const handleDeleteRule = (id: string) => {
-    if (!confirm('Delete this split rule?')) return;
-    deleteSplitRule(id)
+    deleteAutoTransferRule(id)
       .then((res) => {
         setRules(res.rules || []);
-        setMsg({ text: 'Rule deleted.', error: false });
-        logSuccess('Delete split rule', 'Rule deleted.', { ruleId: id });
-        showToast('Rule deleted.');
+        showToast('Rule deleted');
+        logSuccess('Delete auto-transfer rule', 'Rule deleted', { rule_id: id });
       })
       .catch((err) => {
-        const text = err instanceof Error ? err.message : 'Failed to delete';
-        setMsg({ text, error: true });
-        logError('Delete split rule', text, { ruleId: id });
-        showToast(text, 'error');
+        showToast(err instanceof Error ? err.message : 'Failed to delete', 'error');
       });
   };
 
   const productTitle = (id: string) => products.find((p) => p.id === id)?.title || id;
-  const companyTitle = (id: string) => companies.find((c) => c.id === id)?.title || id;
 
   return (
     <main className="main">
       <div className="topbar">
         <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span className="topbar-title">Auto-split</span>
-          <span className="topbar-sub">· Send % to suppliers by product</span>
+          <span className="topbar-title">Auto transfer</span>
+          <span className="topbar-sub">· Send % or fixed amount to any account on payment</span>
         </div>
-        <button
-          className="btn btn-ghost btn-sm"
-          onClick={load}
-          disabled={loading}
-          style={{ gap: 6 }}
-        >
+        <button className="btn btn-ghost btn-sm" onClick={load} disabled={loading} style={{ gap: 6 }}>
           <Icon d={IconPaths.refresh} size={12} />
           {loading ? 'Loading…' : 'Refresh'}
         </button>
       </div>
-
       <div className="content">
         {msg && (
-          <div className={`alert ${msg.error ? 'alert-error' : 'alert-success'}`} style={{ marginBottom: 16 }}>
+          <div className={`alert ${msg.error ? 'alert-error' : 'alert-success'}`}>
             {msg.text}
           </div>
         )}
 
         <div className="card">
           <div className="card-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Icon d={IconPaths.settings} size={14} />
+              <span className="card-title">How to integrate</span>
+            </div>
             <button
               type="button"
               className="btn btn-ghost btn-sm"
-              onClick={() => setDocsOpen((o) => !o)}
-              style={{
-                marginRight: 8,
-                padding: '4px 8px',
-                fontSize: 13,
-                color: 'var(--text-2)',
-                gap: 6,
-              }}
-              title="How to integrate"
+              onClick={() => setDocsOpen(!docsOpen)}
+              style={{ gap: 6 }}
             >
               <Icon d={IconPaths.settings} size={12} />
-              How to integrate
-              <span style={{ fontSize: 10, opacity: 0.8 }}>{docsOpen ? '▼' : '▶'}</span>
+              {docsOpen ? 'Hide' : 'Show'}
             </button>
           </div>
           {docsOpen && (
             <div className="card-body" style={{ borderTop: '1px solid var(--border)', background: 'var(--surface-2)' }}>
               <div className="docs-section">
-                <h3 style={{ fontSize: 15, marginBottom: 12 }}>Auto-split integration</h3>
+                <h3 style={{ fontSize: 15, marginBottom: 12 }}>Auto-transfer integration</h3>
                 <p style={{ marginBottom: 12, color: 'var(--text-2)' }}>
-                  When a payment succeeds, you can automatically send a percentage to one or more connected accounts
-                  (suppliers) based on the purchased product. Two ways to run the split:
+                  When a payment succeeds, you can automatically send a <strong>percentage</strong> or <strong>fixed amount</strong> to
+                  any Whop account (user, company, or ledger) based on the purchased product. Uses the same webhook as Auto-split.
                 </p>
-                <ol style={{ marginLeft: 20, marginBottom: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
-                  <li>
-                    <strong>Webhook (real-time):</strong> Register the URL below in your Whop dashboard so every new
-                    payment triggers the split immediately.
-                  </li>
-                  <li>
-                    <strong>Process recent payments:</strong> Use the button in the &quot;Recent payments&quot; section
-                    below to run splits for paid payments that haven’t been processed yet (e.g. if the webhook wasn’t
-                    set up earlier).
-                  </li>
-                </ol>
                 <h4 style={{ fontSize: 14, marginBottom: 8 }}>1. Webhook URL</h4>
                 <p style={{ marginBottom: 8, color: 'var(--text-2)' }}>
                   In Whop: go to your company → Developer / Webhooks (or API settings). Add an endpoint and subscribe
                   to <code style={{ background: 'var(--surface-3)', padding: '2px 6px', borderRadius: 4 }}>payment.succeeded</code>.
+                  Use the <strong>unique URL below</strong> (same as Auto-split — one webhook runs both).
                 </p>
                 <div
                   style={{
@@ -313,22 +275,12 @@ export default function AutoSplit() {
                       : 'Complete Whop setup in Settings to get your unique webhook URL (with token) for this account.'}
                   </p>
                 )}
-                <h4 style={{ fontSize: 14, marginBottom: 8 }}>2. Requirements</h4>
-                <ul style={{ marginLeft: 20, marginBottom: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
-                  <li>
-                    <code>WHOP_API_KEY</code> and <code>WHOP_PARENT_COMPANY_ID</code> set in the server <code>.env</code>.
-                  </li>
-                  <li>Connected accounts (suppliers) created under Connected accounts; use their company ID as destination.</li>
-                  <li>At least one split rule with a product (or &quot;Any product&quot;) and destination(s) with percentage.</li>
-                  <li>Workflow toggled <strong>On</strong> above.</li>
-                </ul>
-                <h4 style={{ fontSize: 14, marginBottom: 8 }}>3. How it works</h4>
+                <h4 style={{ fontSize: 14, marginBottom: 8 }}>2. How it works</h4>
                 <p style={{ color: 'var(--text-2)', lineHeight: 1.6 }}>
-                  On each <code>payment.succeeded</code> event (or when you run &quot;Process recent payments&quot;), the
-                  server looks up rules that match the payment’s product (and optional plan). For each matching rule it
-                  creates a transfer from your parent company to each destination for the given percentage of the
-                  payment’s <strong>amount_after_fees</strong>. Each payment is only processed once; processed IDs are
-                  stored so the same payment is never split twice.
+                  On each <code>payment.succeeded</code> (or when you run &quot;Process recent payments&quot;), the server runs
+                  auto-transfer rules that match the payment’s product (and optional plan). Each rule sends a <strong>percentage</strong> of
+                  the payment’s amount_after_fees, or a <strong>fixed amount</strong>, to the rule’s destination (user_xxx, biz_xxx, or ldgr_xxx).
+                  Each payment is only processed once for auto-transfer.
                 </p>
               </div>
             </div>
@@ -359,15 +311,13 @@ export default function AutoSplit() {
               disabled={processing}
               style={{ gap: 6 }}
             >
-              {enabled ? 'Disable' : 'Enable'} auto-split
+              {enabled ? 'Disable' : 'Enable'} auto-transfer
             </button>
           </div>
           <div className="card-body">
             <p className="card-desc">
-              When a payment is received, a percentage can be sent automatically to one or more connected accounts
-              (suppliers) based on the purchased product. Configure rules below and enable the workflow. Optionally
-              register the webhook URL shown above in your Whop dashboard
-              for real-time splits, or use &quot;Process recent payments&quot; to catch up.
+              When a payment is received, a percentage or fixed amount can be sent automatically to any account (user, company, or ledger).
+              Add rules below and enable the workflow. Uses the same webhook as Auto-split; or use &quot;Process recent payments&quot; to catch up.
             </p>
           </div>
         </div>
@@ -376,7 +326,7 @@ export default function AutoSplit() {
           <div className="card-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <Icon d={IconPaths.settings} size={14} />
-              <span className="card-title">Split rules</span>
+              <span className="card-title">Transfer rules</span>
               <span
                 style={{
                   background: 'var(--surface-3)',
@@ -398,8 +348,8 @@ export default function AutoSplit() {
               </div>
             ) : rules.length === 0 ? (
               <div className="empty-state">
-                <p>No split rules yet</p>
-                <p>Add a rule below: choose a product (or leave empty for any product) and one or more destinations with percentages.</p>
+                <p>No transfer rules yet</p>
+                <p>Add a rule below: optional product/plan filter, destination (user_xxx, biz_xxx, ldgr_xxx), and percentage or fixed amount.</p>
               </div>
             ) : (
               <>
@@ -413,35 +363,29 @@ export default function AutoSplit() {
                   }}
                 >
                   <div style={{ flex: 2 }}>Product / Plan</div>
-                  <div style={{ flex: 2 }}>Splits</div>
+                  <div style={{ flex: 2 }}>Destination</div>
+                  <div style={{ flex: 1 }}>Type / Value</div>
                   <div style={{ flex: 1 }}>Actions</div>
                 </div>
                 {rules.map((r) => (
                   <div key={r.id} className="account-row">
                     <div style={{ flex: 2 }}>
-                      <div className="account-name">
-                        {r.productId ? productTitle(r.productId) : 'Any product'}
-                      </div>
-                      {r.planId && (
-                        <div className="account-username">Plan: {r.planId}</div>
-                      )}
+                      <div className="account-name">{r.productId ? productTitle(r.productId) : 'Any product'}</div>
+                      {r.planId && <div className="account-username">Plan: {r.planId}</div>}
                     </div>
-                    <div style={{ flex: 2, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                      {(r.splits || []).map((s, i) => (
-                        <span
-                          key={i}
-                          className="badge badge-active"
-                          style={{ background: 'var(--surface-3)', color: 'var(--text-2)', borderColor: 'var(--border)' }}
-                        >
-                          {companyTitle(s.destination_id)}: {s.percentage}%
-                        </span>
-                      ))}
+                    <div style={{ flex: 2 }} className="account-id monospace">
+                      {r.destination_id}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <span className="badge badge-active" style={{ background: 'var(--surface-3)', color: 'var(--text-2)', borderColor: 'var(--border)' }}>
+                        {r.transfer_type === 'fixed' ? `$${r.value}` : `${r.value}%`}
+                      </span>
                     </div>
                     <div style={{ flex: 1 }}>
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm"
-                        style={{ color: 'var(--danger)' }}
+                        style={{ color: 'var(--red)' }}
                         onClick={() => handleDeleteRule(r.id)}
                       >
                         <Icon d={IconPaths.trash} size={12} />
@@ -463,7 +407,7 @@ export default function AutoSplit() {
           </div>
           <div className="card-body">
             <p className="card-desc">
-              Criteria: product (optional — leave empty to match any product) and optional plan ID. Then add one or more destinations with percentage of the payment to send.
+              When a payment matches the product (optional) and plan (optional), send a percentage or fixed amount to the destination. Destination can be any user_xxx, biz_xxx, or ldgr_xxx.
             </p>
             <form onSubmit={handleAddRule}>
               <div className="form-grid-2">
@@ -475,22 +419,22 @@ export default function AutoSplit() {
                     onChange={(e) => setAddProductId(e.target.value)}
                     disabled={addLoading}
                   >
-                    <option value="" disabled={productIdsInAutoTransfer.has('__any__')}>
-                      {productIdsInAutoTransfer.has('__any__') ? 'Any product (used in Auto-transfer)' : 'Any product'}
+                    <option value="" disabled={productIdsInAutoSplit.has('__any__')}>
+                      {productIdsInAutoSplit.has('__any__') ? 'Any product (used in Auto-split)' : 'Any product'}
                     </option>
                     {products.map((p) => {
-                      const inTransfer = productIdsInAutoTransfer.has(p.id);
+                      const inSplit = productIdsInAutoSplit.has(p.id);
                       return (
-                        <option key={p.id} value={p.id} disabled={inTransfer}>
+                        <option key={p.id} value={p.id} disabled={inSplit}>
                           {p.title || p.id}
-                          {inTransfer ? ' (linked to Auto-transfer)' : ''}
+                          {inSplit ? ' (linked to Auto-split)' : ''}
                         </option>
                       );
                     })}
                   </select>
-                  {productIdsInAutoTransfer.size > 0 && (
+                  {productIdsInAutoSplit.size > 0 && (
                     <p style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 6 }}>
-                      Products linked to Auto-transfer cannot be used in Auto-split (one per product).
+                      Products linked to Auto-split cannot be used in Auto-transfer (one per product).
                     </p>
                   )}
                 </div>
@@ -505,53 +449,43 @@ export default function AutoSplit() {
                   />
                 </div>
               </div>
-              <div style={{ marginTop: 16 }}>
-                <label className="field-label">Destinations & percentages</label>
-                {addSplits.map((s, i) => (
-                  <div key={i} className="form-grid-2" style={{ marginTop: 8, alignItems: 'center', gap: 8 }}>
-                    <select
-                      className="select-native"
-                      value={s.destination_id}
-                      onChange={(e) => updateSplitRow(i, 'destination_id', e.target.value)}
-                      disabled={addLoading}
-                    >
-                      <option value="">Select account</option>
-                      {companies.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.title || c.id}
-                        </option>
-                      ))}
-                    </select>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                      <input
-                        className="field-input"
-                        type="number"
-                        step="0.01"
-                        min="0"
-                        max="100"
-                        placeholder="%"
-                        value={s.percentage}
-                        onChange={(e) => updateSplitRow(i, 'percentage', e.target.value)}
-                        disabled={addLoading}
-                        style={{ width: 80 }}
-                      />
-                      <span style={{ color: 'var(--text-2)' }}>%</span>
-                      {addSplits.length > 1 && (
-                        <button
-                          type="button"
-                          className="btn btn-ghost btn-sm"
-                          style={{ color: 'var(--danger)' }}
-                          onClick={() => removeSplitRow(i)}
-                        >
-                          <Icon d={IconPaths.trash} size={12} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-                <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 8 }} onClick={addSplitRow}>
-                  <Icon d={IconPaths.plus} size={12} /> Add destination
-                </button>
+              <div className="field">
+                <label className="field-label">Destination ID *</label>
+                <input
+                  className="field-input monospace"
+                  placeholder="user_xxx, biz_xxx, or ldgr_xxx"
+                  value={addDestinationId}
+                  onChange={(e) => setAddDestinationId(e.target.value)}
+                  disabled={addLoading}
+                />
+              </div>
+              <div className="form-grid-2">
+                <div className="field">
+                  <label className="field-label">Transfer type</label>
+                  <select
+                    className="select-native"
+                    value={addType}
+                    onChange={(e) => setAddType(e.target.value as 'percentage' | 'fixed')}
+                    disabled={addLoading}
+                  >
+                    <option value="percentage">Percentage of payment</option>
+                    <option value="fixed">Fixed amount</option>
+                  </select>
+                </div>
+                <div className="field">
+                  <label className="field-label">{addType === 'percentage' ? 'Percentage (%)' : 'Amount (USD)'}</label>
+                  <input
+                    className="field-input"
+                    type="number"
+                    step={addType === 'percentage' ? '0.01' : '0.01'}
+                    min="0"
+                    max={addType === 'percentage' ? '100' : undefined}
+                    placeholder={addType === 'percentage' ? '10' : '5.00'}
+                    value={addValue}
+                    onChange={(e) => setAddValue(e.target.value)}
+                    disabled={addLoading}
+                  />
+                </div>
               </div>
               <button
                 className="btn btn-primary"
@@ -584,7 +518,7 @@ export default function AutoSplit() {
           </div>
           <div className="card-body">
             <p className="card-desc">
-              Paid payments that have not been processed yet will get splits applied when you run &quot;Process recent payments&quot; (or when the webhook runs). Green check = already processed.
+              Paid payments that have not been processed yet for auto-transfer will get transfers applied when you run &quot;Process recent payments&quot; (or when the webhook runs). Green check = already processed.
             </p>
             {payments.length === 0 ? (
               <div className="empty-state">
