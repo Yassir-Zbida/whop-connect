@@ -71,10 +71,14 @@ async function ensureSessionRole(req) {
 async function getWhopConfig(userId) {
   if (!userId) return { apiKey: '', companyId: '' };
   const s = await db.getUserSettings(userId);
-  if (!s) return { apiKey: '', companyId: '' };
+  const fromDb = {
+    apiKey: (s?.whop_api_key || '').trim(),
+    companyId: (s?.whop_company_id || '').trim(),
+  };
+  // Fallback to server env so production works when .env is set but Settings not saved in UI
   return {
-    apiKey: s.whop_api_key || '',
-    companyId: s.whop_company_id || '',
+    apiKey: fromDb.apiKey || (process.env.WHOP_API_KEY || '').trim(),
+    companyId: fromDb.companyId || (process.env.WHOP_PARENT_COMPANY_ID || '').trim(),
   };
 }
 
@@ -89,6 +93,22 @@ function getWhop(userId) {
 async function getWhopCompanyId(userId) {
   const c = await getWhopConfig(userId);
   return c.companyId;
+}
+
+/** Normalize Whop API errors: return { status, message } for response. 502 + friendly message for 4xx auth. */
+function normalizeWhopError(err, fallbackMessage) {
+  const raw = err?.message || err?.toString?.() || fallbackMessage;
+  const isAuthError =
+    /not authorized|do not have permission|forbidden|bad_request|access to this resource/i.test(raw) ||
+    (typeof raw === 'string' && (raw.includes('"type":"forbidden"') || raw.includes('"type":"bad_request"')));
+  if (isAuthError) {
+    return {
+      status: 502,
+      message:
+        'Whop rejected the request. Check that your API key and Company ID (Settings or server WHOP_API_KEY / WHOP_PARENT_COMPANY_ID) match the same Whop company and have the right permissions.',
+    };
+  }
+  return { status: 500, message: raw };
 }
 
 if (isProduction && (!SESSION_SECRET || SESSION_SECRET === 'whop-admin-secret-change-in-production')) {
@@ -299,8 +319,13 @@ api.get('/companies', requireAuth, async (req, res) => {
       first: 100,
     });
     return res.json({ data: page.data || [] });
-  } catch (_) {
-    return res.json({ data: [] });
+  } catch (err) {
+    const { status, message } = normalizeWhopError(err, 'Failed to list companies');
+    return res.status(status).json({
+      error: status === 502 ? 'Whop rejected request' : 'Whop API error',
+      message,
+      data: [],
+    });
   }
 });
 
@@ -501,9 +526,9 @@ api.get('/transfers', requireAuth, async (req, res) => {
     }));
     return res.json({ data });
   } catch (err) {
-    const message = err?.message || err?.toString?.() || 'Failed to list transfers';
-    return res.status(500).json({
-      error: 'Whop API error',
+    const { status, message } = normalizeWhopError(err, 'Failed to list transfers');
+    return res.status(status).json({
+      error: status === 502 ? 'Whop rejected request' : 'Whop API error',
       message,
       data: [],
     });
@@ -550,9 +575,9 @@ api.get('/members', requireAuth, async (req, res) => {
     }));
     return res.json({ data });
   } catch (err) {
-    const message = err?.message || err?.toString?.() || 'Failed to list members';
-    return res.status(500).json({
-      error: 'Whop API error',
+    const { status, message } = normalizeWhopError(err, 'Failed to list members');
+    return res.status(status).json({
+      error: status === 502 ? 'Whop rejected request' : 'Whop API error',
       message,
       data: [],
     });
@@ -624,9 +649,9 @@ api.get('/products', requireAuth, async (req, res) => {
     }));
     return res.json({ data });
   } catch (err) {
-    const message = err?.message || err?.toString?.() || 'Failed to list products';
-    return res.status(500).json({
-      error: 'Whop API error',
+    const { status, message } = normalizeWhopError(err, 'Failed to list products');
+    return res.status(status).json({
+      error: status === 502 ? 'Whop rejected request' : 'Whop API error',
       message,
       data: [],
     });
@@ -785,7 +810,9 @@ async function runAutoTransferForPayment(paymentId, userId) {
       });
       transfersCreated.push({ transfer_id: transfer.id, destination_id: destId, amount: transferAmount, rule_id: rule.id });
     } catch (e) {
-      errors.push({ destination_id: destId, rule_id: rule.id, message: e?.message || String(e) });
+      const errMsg = e?.message || String(e);
+      errors.push({ destination_id: destId, rule_id: rule.id, message: errMsg });
+      console.error(`[auto-transfer] Failed payment=${paymentId} dest=${destId}: ${errMsg}`);
     }
   }
 
@@ -1047,7 +1074,12 @@ api.post('/webhooks/whop/:token', async (req, res) => {
           email: u?.email,
           action: 'webhook_auto_transfer',
           message: `Auto-transfer ran for payment ${paymentId}`,
-          meta: { payment_id: paymentId, transfers: autoTransferResult.transfersCreated?.length, errors: autoTransferResult.errors?.length },
+          meta: {
+            payment_id: paymentId,
+            transfers: autoTransferResult.transfersCreated?.length ?? 0,
+            errors: autoTransferResult.errors?.length ?? 0,
+            error_details: autoTransferResult.errors ?? [],
+          },
         });
       }
     } catch (_) {}
