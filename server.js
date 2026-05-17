@@ -111,6 +111,36 @@ function normalizeWhopError(err, fallbackMessage) {
   return { status: 500, message: raw };
 }
 
+/** Detect Whop balance reserves on a connected account (warn before auto-transfer setup). */
+async function getConnectedAccountReserveWarning(whop, companyId) {
+  if (!whop || !companyId) return null;
+  try {
+    const details = await whop.companies.retrieve(companyId);
+    const pct = details?.reserve_percentage;
+    if (typeof pct === 'number' && pct > 0) {
+      return `This account has a ${pct}% reserve set by Whop. Auto-transfers will fail until the reserve is removed. Contact Whop support.`;
+    }
+  } catch (_) {
+    // fall through to ledger balance check
+  }
+  try {
+    const ledger = await whop.ledgerAccounts.retrieve(companyId);
+    const balances = Array.isArray(ledger?.balances) ? ledger.balances : [];
+    const reserved = balances.filter((b) => Number(b.reserve_balance) > 0);
+    if (reserved.length === 0) return null;
+    const parts = reserved.map((b) => {
+      const reserve = Number(b.reserve_balance) || 0;
+      const balance = Number(b.balance) || 0;
+      const cur = String(b.currency || 'usd').toUpperCase();
+      const pct = balance > 0 ? Math.round((reserve / balance) * 100) : null;
+      return pct != null && pct > 0 ? `${pct}% (${cur})` : `${reserve.toFixed(2)} ${cur} held`;
+    });
+    return `Whop has placed a reserve on this account (${parts.join(', ')}). Auto-transfers will fail until the reserve is removed. Contact Whop support.`;
+  } catch (_) {
+    return null;
+  }
+}
+
 if (isProduction && (!SESSION_SECRET || SESSION_SECRET === 'whop-admin-secret-change-in-production')) {
   console.warn('SECURITY: Set a strong SESSION_SECRET in .env for production.');
 }
@@ -364,13 +394,20 @@ api.post('/companies', requireAuth, async (req, res) => {
       title: company.title || '',
     });
 
+    let warning = null;
+    try {
+      warning = await getConnectedAccountReserveWarning(whop, company.id);
+    } catch (_) {}
+
     const u = await db.getUserById(userId);
     await db.insertActivityLog({
       userId,
       email: u?.email,
       action: 'company_create',
-      message: `Created company: ${company.title}`,
-      meta: { company_id: company.id },
+      message: warning
+        ? `Created company: ${company.title} (reserve detected)`
+        : `Created company: ${company.title}`,
+      meta: { company_id: company.id, ...(warning ? { reserve_warning: warning } : {}) },
     });
 
     return res.status(201).json({
@@ -378,6 +415,7 @@ api.post('/companies', requireAuth, async (req, res) => {
       email: company.email,
       title: company.title,
       message: 'Connected account created. Use company id to send funds.',
+      ...(warning ? { warning } : {}),
     });
   } catch (err) {
     const message = err?.message || err?.toString?.() || 'Unknown error';

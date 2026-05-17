@@ -21,6 +21,7 @@ export default function ConnectedAccounts() {
   const [enrollInternalId, setEnrollInternalId] = useState('');
   const [enrollTier, setEnrollTier] = useState('');
   const [enrollMsg, setEnrollMsg] = useState<{ text: string; error: boolean } | null>(null);
+  const [enrollWarning, setEnrollWarning] = useState<string | null>(null);
   const [enrollLoading, setEnrollLoading] = useState(false);
   const [destId, setDestId] = useState('');
   const [amount, setAmount] = useState('');
@@ -51,6 +52,7 @@ export default function ConnectedAccounts() {
   const handleEnroll = async (e: React.FormEvent) => {
     e.preventDefault();
     setEnrollMsg(null);
+    setEnrollWarning(null);
     if (!enrollEmail.trim() || !enrollTitle.trim()) {
       const text = 'Email and display name are required.';
       setEnrollMsg({ text, error: true });
@@ -68,8 +70,14 @@ export default function ConnectedAccounts() {
       });
       const text = `Connected account created. ID: ${res.id}`;
       setEnrollMsg({ text, error: false });
-      logSuccess('Create company', text, { companyId: res.id });
-      showToast(text);
+      if (res.warning) {
+        setEnrollWarning(res.warning);
+        logError('Create company', res.warning, { companyId: res.id, reserve: true });
+        showToast('Account created, but Whop reserve detected — see warning below.', 'error');
+      } else {
+        logSuccess('Create company', text, { companyId: res.id });
+        showToast(text);
+      }
       setDestId(res.id);
       setEnrollEmail('');
       setEnrollTitle('');
@@ -320,6 +328,9 @@ export default function ConnectedAccounts() {
                   <div className={`alert ${enrollMsg.error ? 'alert-error' : 'alert-success'}`}>
                     {enrollMsg.text}
                   </div>
+                )}
+                {enrollWarning && (
+                  <div className="alert alert-warning">{enrollWarning}</div>
                 )}
                 <button
                   className="btn btn-primary"

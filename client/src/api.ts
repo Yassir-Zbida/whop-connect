@@ -70,8 +70,8 @@ export async function getCompanies(): Promise<{ data: Array<{ id: string; title?
   return request<{ data: Array<{ id: string; title?: string; owner_user?: { username?: string } }> }>('/api/companies');
 }
 
-export async function createCompany(body: { email: string; title: string; internal_user_id?: string; seller_tier?: string }): Promise<{ id: string }> {
-  return request<{ id: string }>('/api/companies', { method: 'POST', body: JSON.stringify(body) });
+export async function createCompany(body: { email: string; title: string; internal_user_id?: string; seller_tier?: string }): Promise<{ id: string; warning?: string }> {
+  return request<{ id: string; warning?: string }>('/api/companies', { method: 'POST', body: JSON.stringify(body) });
 }
 
 export async function updateCompany(id: string, body: { title?: string; description?: string }): Promise<{ id: string; title?: string; message: string }> {
