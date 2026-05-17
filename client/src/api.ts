@@ -66,8 +66,16 @@ export async function logout(): Promise<void> {
   await fetch(BASE + '/api/logout', { method: 'POST', credentials: 'include' });
 }
 
-export async function getCompanies(): Promise<{ data: Array<{ id: string; title?: string; owner_user?: { username?: string } }> }> {
-  return request<{ data: Array<{ id: string; title?: string; owner_user?: { username?: string } }> }>('/api/companies');
+export type CompanyReserve = {
+  has_reserve: boolean;
+  percentage: number | null;
+  checked: boolean;
+};
+
+export async function getCompanies(): Promise<{
+  data: Array<{ id: string; title?: string; owner_user?: { username?: string }; reserve?: CompanyReserve }>;
+}> {
+  return request('/api/companies');
 }
 
 export async function createCompany(body: { email: string; title: string; internal_user_id?: string; seller_tier?: string }): Promise<{ id: string; warning?: string }> {

@@ -111,14 +111,16 @@ function normalizeWhopError(err, fallbackMessage) {
   return { status: 500, message: raw };
 }
 
-/** Detect Whop balance reserves on a connected account (warn before auto-transfer setup). */
-async function getConnectedAccountReserveWarning(whop, companyId) {
-  if (!whop || !companyId) return null;
+/** Reserve status for a connected account (ledger + optional company field). */
+async function getConnectedAccountReserveInfo(whop, companyId) {
+  if (!whop || !companyId) {
+    return { has_reserve: false, percentage: null, checked: false };
+  }
   try {
     const details = await whop.companies.retrieve(companyId);
     const pct = details?.reserve_percentage;
     if (typeof pct === 'number' && pct > 0) {
-      return `This account has a ${pct}% reserve set by Whop. Auto-transfers will fail until the reserve is removed. Contact Whop support.`;
+      return { has_reserve: true, percentage: pct, checked: true };
     }
   } catch (_) {
     // fall through to ledger balance check
@@ -127,18 +129,38 @@ async function getConnectedAccountReserveWarning(whop, companyId) {
     const ledger = await whop.ledgerAccounts.retrieve(companyId);
     const balances = Array.isArray(ledger?.balances) ? ledger.balances : [];
     const reserved = balances.filter((b) => Number(b.reserve_balance) > 0);
-    if (reserved.length === 0) return null;
-    const parts = reserved.map((b) => {
+    if (reserved.length === 0) {
+      return { has_reserve: false, percentage: 0, checked: true };
+    }
+    let maxPct = 0;
+    for (const b of reserved) {
       const reserve = Number(b.reserve_balance) || 0;
       const balance = Number(b.balance) || 0;
-      const cur = String(b.currency || 'usd').toUpperCase();
-      const pct = balance > 0 ? Math.round((reserve / balance) * 100) : null;
-      return pct != null && pct > 0 ? `${pct}% (${cur})` : `${reserve.toFixed(2)} ${cur} held`;
-    });
-    return `Whop has placed a reserve on this account (${parts.join(', ')}). Auto-transfers will fail until the reserve is removed. Contact Whop support.`;
+      const pct = balance > 0 ? Math.round((reserve / balance) * 100) : 0;
+      if (pct > maxPct) maxPct = pct;
+    }
+    return {
+      has_reserve: true,
+      percentage: maxPct > 0 ? maxPct : null,
+      checked: true,
+    };
   } catch (_) {
-    return null;
+    return { has_reserve: false, percentage: null, checked: false };
   }
+}
+
+function formatReserveWarning(info) {
+  if (!info?.has_reserve) return null;
+  const pct = info.percentage;
+  if (typeof pct === 'number' && pct > 0) {
+    return `This account has a ${pct}% reserve set by Whop. Auto-transfers will fail until the reserve is removed. Contact Whop support.`;
+  }
+  return 'Whop has placed a reserve on this account. Auto-transfers will fail until the reserve is removed. Contact Whop support.';
+}
+
+async function getConnectedAccountReserveWarning(whop, companyId) {
+  const info = await getConnectedAccountReserveInfo(whop, companyId);
+  return formatReserveWarning(info);
 }
 
 if (isProduction && (!SESSION_SECRET || SESSION_SECRET === 'whop-admin-secret-change-in-production')) {
@@ -348,7 +370,14 @@ api.get('/companies', requireAuth, async (req, res) => {
       parent_company_id: companyId,
       first: 100,
     });
-    return res.json({ data: page.data || [] });
+    const companies = page.data || [];
+    const data = await Promise.all(
+      companies.map(async (company) => {
+        const reserve = await getConnectedAccountReserveInfo(whop, company.id);
+        return { ...company, reserve };
+      })
+    );
+    return res.json({ data });
   } catch (err) {
     const { status, message } = normalizeWhopError(err, 'Failed to list companies');
     return res.status(status).json({

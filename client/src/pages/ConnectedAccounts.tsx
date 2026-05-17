@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon, IconPaths } from '../components/Icon';
-import { getCompanies, createCompany, createTransfer, getSettings } from '../api';
+import { getCompanies, createCompany, createTransfer, getSettings, type CompanyReserve } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 
@@ -9,7 +9,34 @@ type Company = {
   id: string;
   title?: string;
   owner_user?: { username?: string };
+  reserve?: CompanyReserve;
 };
+
+function ReserveBadge({ reserve }: { reserve?: CompanyReserve }) {
+  if (!reserve?.checked) {
+    return (
+      <span className="badge badge-reserve-unknown" title="Could not check reserve (API may need company:balance:read)">
+        Unknown
+      </span>
+    );
+  }
+  if (reserve.has_reserve) {
+    const label =
+      typeof reserve.percentage === 'number' && reserve.percentage > 0
+        ? `${reserve.percentage}% reserve`
+        : 'Reserve active';
+    return (
+      <span className="badge badge-reserve-yes" title="Whop hold — auto-transfers may fail until removed">
+        {label}
+      </span>
+    );
+  }
+  return (
+    <span className="badge badge-reserve-none" title="No Whop reserve detected">
+      No reserve
+    </span>
+  );
+}
 
 export default function ConnectedAccounts() {
   const navigate = useNavigate();
@@ -218,6 +245,9 @@ export default function ConnectedAccounts() {
               <div style={{ flex: 1, fontSize: 14, fontWeight: 600, color: 'var(--text-2)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
                 Status
               </div>
+              <div style={{ flex: 1, fontSize: 14, fontWeight: 600, color: 'var(--text-2)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                Reserve
+              </div>
               <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end', fontSize: 14, fontWeight: 600, color: 'var(--text-2)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
                 Actions
               </div>
@@ -225,7 +255,7 @@ export default function ConnectedAccounts() {
 
             {loading ? (
               <div className="empty-state">
-                <p>Loading…</p>
+                <p>Loading accounts and reserve status…</p>
               </div>
             ) : companies.length === 0 ? (
               <div className="empty-state">
@@ -247,6 +277,9 @@ export default function ConnectedAccounts() {
                       <span className="badge-dot" />
                       Active
                     </span>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <ReserveBadge reserve={c.reserve} />
                   </div>
                   <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
                     <button
