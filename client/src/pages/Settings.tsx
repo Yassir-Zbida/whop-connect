@@ -15,6 +15,8 @@ export default function Settings() {
   const [savingPassword, setSavingPassword] = useState(false);
   const [whopApiKey, setWhopApiKey] = useState('');
   const [whopCompanyId, setWhopCompanyId] = useState('');
+  const [whopWebhookSecret, setWhopWebhookSecret] = useState('');
+  const [webhookSecretSet, setWebhookSecretSet] = useState(false);
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -32,6 +34,7 @@ export default function Settings() {
         setWhopCompanyId(s.whopCompanyId || '');
         setAdminPasswordSet(s.adminPasswordSet);
         setWebhookUrl(s.webhookUrl ?? null);
+        setWebhookSecretSet(Boolean(s.whopWebhookSecretSet));
       })
       .catch(() => setMsgWhop({ text: 'Failed to load settings', error: true }))
       .finally(() => setLoading(false));
@@ -40,7 +43,7 @@ export default function Settings() {
   const handleSaveWhop = async (e: React.FormEvent) => {
     e.preventDefault();
     setMsgWhop(null);
-    if (!whopApiKey.trim() && !whopCompanyId.trim()) {
+    if (!whopApiKey.trim() && !whopCompanyId.trim() && !whopWebhookSecret.trim()) {
       setMsgWhop({ text: 'Enter at least one value to save.', error: true });
       return;
     }
@@ -49,16 +52,19 @@ export default function Settings() {
       await updateSettings({
         ...(whopApiKey.trim() && { whopApiKey: whopApiKey.trim() }),
         ...(whopCompanyId.trim() && { whopCompanyId: whopCompanyId.trim() }),
+        ...(whopWebhookSecret.trim() && { whopWebhookSecret: whopWebhookSecret.trim() }),
       });
       logSuccess('Settings', 'Whop API & Company saved');
       showToast('Whop settings saved');
       setMsgWhop({ text: 'Saved.', error: false });
       window.dispatchEvent(new CustomEvent('whop-settings-saved'));
       setWhopApiKey('');
+      setWhopWebhookSecret('');
       getSettings().then((s) => {
         setMaskedApiKey(s.whopApiKeyMasked);
         setWhopCompanyId(s.whopCompanyId || '');
         setWebhookUrl(s.webhookUrl ?? null);
+        setWebhookSecretSet(Boolean(s.whopWebhookSecretSet));
       });
     } catch (err) {
       const text = err instanceof Error ? err.message : 'Failed to save';
@@ -82,9 +88,14 @@ export default function Settings() {
       showToast('Passwords do not match', 'error');
       return;
     }
-    if (newPassword.length < 6) {
-      setMsgPassword({ text: 'New password must be at least 6 characters.', error: true });
+    if (newPassword.length < 12) {
+      setMsgPassword({ text: 'New password must be at least 12 characters.', error: true });
       showToast('Password too short', 'error');
+      return;
+    }
+    if (!/[a-zA-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+      setMsgPassword({ text: 'Password must include at least one letter and one number.', error: true });
+      showToast('Password too weak', 'error');
       return;
     }
     setSavingPassword(true);
@@ -244,6 +255,26 @@ export default function Settings() {
                   Your platform company ID from Whop Dashboard.
                 </p>
               </div>
+              <div className="field">
+                <label className="field-label">Whop Webhook Secret</label>
+                {webhookSecretSet && !whopWebhookSecret && (
+                  <p style={{ fontSize: 12, color: 'var(--success)', marginBottom: 6 }}>
+                    Webhook secret is saved. Enter a new value only to replace it.
+                  </p>
+                )}
+                <input
+                  className="field-input"
+                  type="password"
+                  placeholder="From Whop Developer → Webhooks (required for auto-split)"
+                  value={whopWebhookSecret}
+                  onChange={(e) => setWhopWebhookSecret(e.target.value)}
+                  autoComplete="off"
+                  disabled={savingWhop}
+                />
+                <p style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>
+                  Copy from your Whop webhook settings. Used to verify incoming payment events.
+                </p>
+              </div>
               <button className="btn btn-primary" type="submit" disabled={savingWhop} style={{ marginTop: 8 }}>
                 {savingWhop ? 'Saving…' : 'Save settings'}
               </button>
@@ -329,7 +360,7 @@ export default function Settings() {
                 <input
                   className="field-input"
                   type="password"
-                  placeholder="Min 6 characters"
+                  placeholder="Min 12 characters, letter + number"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   autoComplete="new-password"

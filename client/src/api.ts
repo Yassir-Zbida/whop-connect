@@ -2,8 +2,28 @@ import { logApiRequest, logApiResponse } from './utils/logger';
 
 const BASE = '';
 
+let csrfToken: string | null = null;
+
+export function setCsrfToken(token: string | null) {
+  csrfToken = token;
+}
+
+export async function fetchCsrfToken(): Promise<string> {
+  const res = await fetch(BASE + '/api/csrf', { credentials: 'include' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.csrfToken) {
+    throw new Error('Could not load security token');
+  }
+  csrfToken = data.csrfToken as string;
+  return csrfToken;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const method = (options?.method || 'GET').toUpperCase();
+  const isMutation = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+  if (isMutation && !csrfToken) {
+    await fetchCsrfToken();
+  }
   logApiRequest(method, path);
   const start = Date.now();
   const res = await fetch(BASE + path, {
@@ -11,6 +31,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
+      ...(isMutation && csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
       ...options?.headers,
     },
   });
@@ -48,22 +69,41 @@ export async function getMe(): Promise<{ user: User | null } | null> {
   }
 }
 
-export async function register(email: string, password: string): Promise<{ ok: boolean; user: User }> {
-  return request<{ ok: boolean; user: User }>('/api/register', {
+export async function register(
+  email: string,
+  password: string
+): Promise<{ ok: boolean; user: User; csrfToken?: string }> {
+  const res = await request<{ ok: boolean; user: User; csrfToken?: string }>('/api/register', {
     method: 'POST',
     body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
   });
+  if (res.csrfToken) setCsrfToken(res.csrfToken);
+  return res;
 }
 
-export async function login(email: string, password: string): Promise<{ ok: boolean; user: User }> {
-  return request<{ ok: boolean; user: User }>('/api/login', {
+export async function login(
+  email: string,
+  password: string
+): Promise<{ ok: boolean; user: User; csrfToken?: string }> {
+  const res = await request<{ ok: boolean; user: User; csrfToken?: string }>('/api/login', {
     method: 'POST',
     body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
   });
+  if (res.csrfToken) setCsrfToken(res.csrfToken);
+  return res;
 }
 
 export async function logout(): Promise<void> {
-  await fetch(BASE + '/api/logout', { method: 'POST', credentials: 'include' });
+  if (!csrfToken) await fetchCsrfToken();
+  await fetch(BASE + '/api/logout', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
+    },
+  });
+  setCsrfToken(null);
 }
 
 export type CompanyReserve = {
@@ -298,6 +338,7 @@ export type Settings = {
   whopCompanyIdSet: boolean;
   whopApiKeyMasked: string | null;
   whopCompanyId: string | null;
+  whopWebhookSecretSet?: boolean;
   adminPasswordSet: boolean;
   webhookUrl?: string | null;
 };
@@ -309,6 +350,7 @@ export async function getSettings(): Promise<Settings> {
 export async function updateSettings(body: {
   whopApiKey?: string;
   whopCompanyId?: string;
+  whopWebhookSecret?: string;
   currentPassword?: string;
   newPassword?: string;
 }): Promise<{ ok: boolean; message?: string }> {
@@ -345,7 +387,7 @@ export type ActivityLogEntry = {
 export type AdminLogsFilters = {
   user_id?: number;
   email?: string;
-  from?: string; // ISO date or datetime
+  from?: string;
   to?: string;
   action?: string;
 };

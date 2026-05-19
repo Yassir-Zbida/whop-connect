@@ -45,8 +45,9 @@ CREATE TABLE connected_accounts (
 -- Per-user Whop settings and webhook token (one row per user)
 CREATE TABLE user_settings (
   user_id INT UNSIGNED NOT NULL PRIMARY KEY,
-  whop_api_key VARCHAR(512) NOT NULL DEFAULT '',
+  whop_api_key VARCHAR(1024) NOT NULL DEFAULT '',
   whop_company_id VARCHAR(128) NOT NULL DEFAULT '',
+  whop_webhook_secret VARCHAR(1024) NOT NULL DEFAULT '',
   webhook_token VARCHAR(64) NOT NULL DEFAULT '',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

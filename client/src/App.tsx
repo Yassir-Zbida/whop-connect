@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
-import { getMe, logout } from './api';
+import { fetchCsrfToken, getMe, logout } from './api';
 import { useToast } from './context/ToastContext';
 import { logSuccess, logInfo } from './utils/logger';
 import Login from './pages/Login';
@@ -43,7 +43,9 @@ export default function App() {
 
   useEffect(() => {
     logInfo('App', 'Application started');
-    refreshUser().finally(() => setLoading(false));
+    fetchCsrfToken()
+      .catch(() => {})
+      .finally(() => refreshUser().finally(() => setLoading(false)));
   }, []);
 
   const onLogin = (userFromResponse?: { id: number; email: string; role?: 'user' | 'admin' } | null) => {

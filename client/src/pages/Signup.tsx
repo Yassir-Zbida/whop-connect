@@ -27,8 +27,14 @@ export default function Signup({ onSignup }: Props) {
       showToast(msg, 'error');
       return;
     }
-    if (password.length < 6) {
-      const msg = 'Password must be at least 6 characters.';
+    if (password.length < 12) {
+      const msg = 'Password must be at least 12 characters.';
+      setError(msg);
+      showToast(msg, 'error');
+      return;
+    }
+    if (!/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+      const msg = 'Password must include at least one letter and one number.';
       setError(msg);
       showToast(msg, 'error');
       return;
@@ -86,7 +92,7 @@ export default function Signup({ onSignup }: Props) {
                 <input
                   className="field-input"
                   type={showPassword ? 'text' : 'password'}
-                  placeholder="At least 6 characters"
+                  placeholder="At least 12 characters, letter + number"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   autoComplete="new-password"

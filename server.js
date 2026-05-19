@@ -25,13 +25,36 @@ import session from 'express-session';
 import helmet from 'helmet';
 import bcrypt from 'bcrypt';
 import Whop from '@whop/sdk';
+import { Webhook } from 'standardwebhooks';
 import * as db from './db.js';
+import { encodeWebhookKeyForSdk, ensureEncryptionKey } from './lib/crypto.js';
+import {
+  allowSharedWhopEnvFallback,
+  ensureSessionSecret,
+  isAdminEmailPromotionAllowed,
+  isRegistrationAllowed,
+  validatePassword,
+} from './lib/security.js';
+import {
+  apiRateLimiter,
+  authRateLimiter,
+  captureRawBody,
+  csrfProtection,
+  ensureCsrfToken,
+  regenerateSession,
+} from './lib/middleware.js';
+import {
+  companyBelongsToParent,
+  productBelongsToCompany,
+  transferBelongsToCompany,
+} from './lib/whop-access.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 const USE_SECURE_COOKIES = process.env.COOKIE_SECURE === 'true';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'whop-admin-secret-change-in-production';
+const SESSION_SECRET = ensureSessionSecret(isProduction);
+ensureEncryptionKey(isProduction);
 
 // Only trust proxy when we know we're behind HTTPS and using secure cookies
 if (USE_SECURE_COOKIES) app.set('trust proxy', 1);
@@ -75,11 +98,16 @@ async function getWhopConfig(userId) {
     apiKey: (s?.whop_api_key || '').trim(),
     companyId: (s?.whop_company_id || '').trim(),
   };
-  // Fallback to server env so production works when .env is set but Settings not saved in UI
-  return {
-    apiKey: fromDb.apiKey || (process.env.WHOP_API_KEY || '').trim(),
-    companyId: fromDb.companyId || (process.env.WHOP_PARENT_COMPANY_ID || '').trim(),
-  };
+  if (fromDb.apiKey && fromDb.companyId) {
+    return fromDb;
+  }
+  if (allowSharedWhopEnvFallback()) {
+    return {
+      apiKey: fromDb.apiKey || (process.env.WHOP_API_KEY || '').trim(),
+      companyId: fromDb.companyId || (process.env.WHOP_PARENT_COMPANY_ID || '').trim(),
+    };
+  }
+  return fromDb;
 }
 
 function getWhop(userId) {
@@ -163,34 +191,46 @@ async function getConnectedAccountReserveWarning(whop, companyId) {
   return formatReserveWarning(info);
 }
 
-if (isProduction && (!SESSION_SECRET || SESSION_SECRET === 'whop-admin-secret-change-in-production')) {
-  console.warn('SECURITY: Set a strong SESSION_SECRET in .env for production.');
-}
-
-// Security: HTTP headers (X-Content-Type-Options, X-Frame-Options, etc.)
+// Security: HTTP headers (X-Content-Type-Options, X-Frame-Options, CSP in production)
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: isProduction
+      ? {
+          directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", 'data:'],
+            connectSrc: ["'self'"],
+            fontSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            frameAncestors: ["'none'"],
+          },
+        }
+      : false,
     crossOriginResourcePolicy: { policy: 'same-site' },
   })
 );
 
-// Body parser with size limit to prevent large payloads
-app.use(express.json({ limit: '256kb' }));
+// Body parser with size limit; capture raw body for webhook signature verification
+app.use(
+  express.json({
+    limit: '256kb',
+    verify: captureRawBody,
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 
 app.use(
   session({
     secret: SESSION_SECRET,
     resave: false,
-    saveUninitialized: false,
+    saveUninitialized: true,
     name: 'whop.sid',
     cookie: {
       httpOnly: true,
-      // In local dev over http://localhost, COOKIE_SECURE should be false (or unset)
-      // so that cookies are not marked secure and are sent over HTTP.
       secure: USE_SECURE_COOKIES,
-      sameSite: 'lax',
+      sameSite: 'strict',
       maxAge: 24 * 60 * 60 * 1000,
       path: '/',
     },
@@ -210,6 +250,13 @@ function requireAuth(req, res, next) {
 
 // ——— API router (mounted at /api) ———
 const api = express.Router();
+api.use(apiRateLimiter);
+api.use(csrfProtection);
+
+api.get('/csrf', (req, res) => {
+  const token = ensureCsrfToken(req);
+  return res.json({ csrfToken: token });
+});
 
 api.get('/me', async (req, res) => {
   await ensureSessionRole(req);
@@ -220,34 +267,47 @@ api.get('/me', async (req, res) => {
   return res.json({ user: u ?? null });
 });
 
-api.post('/register', async (req, res) => {
+api.post('/register', authRateLimiter, async (req, res) => {
+  if (!isRegistrationAllowed()) {
+    return res.status(403).json({
+      error: 'Registration disabled',
+      message: 'Public sign-up is disabled on this server.',
+    });
+  }
   const { email, password } = req.body || {};
   const e = email != null ? String(email).trim().toLowerCase() : '';
   const p = password != null ? String(password) : '';
   if (!e || !p) {
     return res.status(400).json({ error: 'Missing email or password' });
   }
-  if (p.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const pwCheck = validatePassword(p);
+  if (!pwCheck.ok) {
+    return res.status(400).json({ error: pwCheck.message });
   }
   try {
     const existing = await db.findUserByEmail(e);
     if (existing) {
       return res.status(409).json({ error: 'Email already registered', message: 'Use login instead.' });
     }
-    const role = ADMIN_EMAIL && e === ADMIN_EMAIL ? 'admin' : 'user';
+    const role =
+      isAdminEmailPromotionAllowed() && ADMIN_EMAIL && e === ADMIN_EMAIL ? 'admin' : 'user';
     const hash = await hashPassword(p);
     const userId = await db.createUser(e, hash, role);
+    await regenerateSession(req);
     req.session.user = { id: userId, email: e, role };
     await db.insertActivityLog({ userId, email: e, action: 'register', message: 'User signed up' });
-    return res.status(201).json({ ok: true, user: { id: userId, email: e, role } });
+    return res.status(201).json({
+      ok: true,
+      user: { id: userId, email: e, role },
+      csrfToken: req.session.csrfToken,
+    });
   } catch (err) {
     console.error('Register error:', err);
     return res.status(500).json({ error: 'Server error', message: 'Could not create account.' });
   }
 });
 
-api.post('/login', async (req, res) => {
+api.post('/login', authRateLimiter, async (req, res) => {
   const { email, password } = req.body || {};
   const e = email != null ? String(email).trim().toLowerCase() : '';
   const p = password != null ? String(password) : '';
@@ -267,13 +327,18 @@ api.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     let role = user.role === 'admin' ? 'admin' : 'user';
-    if (ADMIN_EMAIL && e === ADMIN_EMAIL && role !== 'admin') {
+    if (isAdminEmailPromotionAllowed() && ADMIN_EMAIL && e === ADMIN_EMAIL && role !== 'admin') {
       await db.updateUserRole(user.id, 'admin');
       role = 'admin';
     }
+    await regenerateSession(req);
     req.session.user = { id: user.id, email: user.email, role };
     await db.insertActivityLog({ userId: user.id, email: user.email, action: 'login', message: 'User logged in' });
-    return res.json({ ok: true, user: { id: user.id, email: user.email, role: role || 'user' } });
+    return res.json({
+      ok: true,
+      user: { id: user.id, email: user.email, role: role || 'user' },
+      csrfToken: req.session.csrfToken,
+    });
   } catch (_) {
     return res.status(500).json({ error: 'Server error', message: 'Could not verify password.' });
   }
@@ -319,6 +384,7 @@ api.get('/settings', requireAuth, async (req, res) => {
   const masked = key ? (key.slice(0, 8) + '…' + key.slice(-4)) : '';
   const settings = await db.getUserSettings(userId);
   const webhookToken = settings?.webhook_token || null;
+  const webhookSecretSet = Boolean(settings?.whop_webhook_secret);
   const baseUrl = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'production' ? '' : `http://localhost:${PORT}`);
   const webhookUrl = webhookToken && baseUrl ? `${baseUrl}/api/webhooks/whop/${webhookToken}` : null;
   return res.json({
@@ -326,6 +392,7 @@ api.get('/settings', requireAuth, async (req, res) => {
     whopCompanyIdSet: Boolean(config.companyId),
     whopApiKeyMasked: masked || null,
     whopCompanyId: config.companyId || null,
+    whopWebhookSecretSet: webhookSecretSet,
     adminPasswordSet: true,
     webhookUrl,
   });
@@ -333,11 +400,15 @@ api.get('/settings', requireAuth, async (req, res) => {
 
 api.put('/settings', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const { whopApiKey, whopCompanyId, currentPassword, newPassword } = req.body || {};
+  const { whopApiKey, whopCompanyId, whopWebhookSecret, currentPassword, newPassword } = req.body || {};
 
   if (typeof newPassword === 'string' && newPassword.trim()) {
     if (!currentPassword || typeof currentPassword !== 'string') {
       return res.status(400).json({ error: 'Current password is required to set a new password.' });
+    }
+    const pwCheck = validatePassword(newPassword.trim());
+    if (!pwCheck.ok) {
+      return res.status(400).json({ error: pwCheck.message });
     }
     const user = await db.getUserById(userId);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
@@ -348,7 +419,7 @@ api.put('/settings', requireAuth, async (req, res) => {
     await db.updateUserPassword(userId, await hashPassword(newPassword.trim()));
   }
 
-  await db.setUserSettings(userId, { whopApiKey, whopCompanyId });
+  await db.setUserSettings(userId, { whopApiKey, whopCompanyId, whopWebhookSecret });
   const u = await db.getUserById(userId);
   await db.insertActivityLog({
     userId,
@@ -466,8 +537,12 @@ api.patch('/companies/:id', requireAuth, async (req, res) => {
     });
   }
   const { id } = req.params;
+  const companyId = await getWhopCompanyId(userId);
   if (!id) {
     return res.status(400).json({ error: 'Missing company id', message: 'Company ID is required.' });
+  }
+  if (!(await companyBelongsToParent(whop, companyId, id))) {
+    return res.status(403).json({ error: 'Forbidden', message: 'You do not have access to this company.' });
   }
   try {
     const { title, description } = req.body || {};
@@ -654,6 +729,7 @@ api.get('/members', requireAuth, async (req, res) => {
 api.get('/transfers/:id', requireAuth, async (req, res) => {
   const userId = getUserId(req);
   const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
@@ -662,6 +738,9 @@ api.get('/transfers/:id', requireAuth, async (req, res) => {
   }
   try {
     const transfer = await whop.transfers.retrieve(req.params.id);
+    if (!transferBelongsToCompany(transfer, companyId)) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Transfer not found.' });
+    }
     return res.json({
       id: transfer.id,
       amount: transfer.amount,
@@ -728,6 +807,7 @@ api.get('/products', requireAuth, async (req, res) => {
 api.get('/products/:id', requireAuth, async (req, res) => {
   const userId = getUserId(req);
   const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
   if (!whop) {
     return res.status(503).json({
       error: 'Whop API not configured',
@@ -736,6 +816,9 @@ api.get('/products/:id', requireAuth, async (req, res) => {
   }
   try {
     const product = await whop.products.retrieve(req.params.id);
+    if (!productBelongsToCompany(product, companyId)) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Product not found.' });
+    }
     return res.json({
       id: product.id,
       title: product.title,
@@ -1092,7 +1175,7 @@ api.post('/process-payments-auto-transfer', requireAuth, async (req, res) => {
   }
 });
 
-// Webhook: Whop payment.succeeded — URL includes user's token so we know which account to run split for
+// Webhook: Whop payment.succeeded — URL token routes to user; signature verified with per-user webhook secret
 api.post('/webhooks/whop/:token', async (req, res) => {
   const token = req.params.token;
   const user = await db.getUserByWebhookToken(token);
@@ -1102,7 +1185,40 @@ api.post('/webhooks/whop/:token', async (req, res) => {
     } catch (_) {}
     return res.status(404).json({ received: true, error: 'Unknown webhook token' });
   }
-  const body = req.body || {};
+
+  const settings = await db.getUserSettings(user.id);
+  const webhookSecret = settings?.whop_webhook_secret?.trim() || '';
+  if (!webhookSecret) {
+    return res.status(503).json({
+      received: false,
+      error: 'Webhook secret not configured',
+      message: 'Add your Whop webhook secret in Settings before accepting webhooks.',
+    });
+  }
+
+  const rawBody =
+    req.rawBody != null
+      ? Buffer.isBuffer(req.rawBody)
+        ? req.rawBody.toString('utf8')
+        : String(req.rawBody)
+      : JSON.stringify(req.body || {});
+
+  let body;
+  try {
+    const verifier = new Webhook(encodeWebhookKeyForSdk(webhookSecret));
+    body = verifier.verify(rawBody, req.headers);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err?.message);
+    try {
+      await db.insertActivityLog({
+        userId: user.id,
+        action: 'webhook_invalid_signature',
+        message: 'Webhook rejected: invalid signature',
+      });
+    } catch (_) {}
+    return res.status(401).json({ received: false, error: 'Invalid webhook signature' });
+  }
+
   const type = body?.type || body?.action;
   const u = await db.getUserById(user.id);
   try {

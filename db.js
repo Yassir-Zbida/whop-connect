@@ -5,6 +5,7 @@
 
 import mysql from 'mysql2/promise';
 import crypto from 'crypto';
+import { decrypt, encrypt } from './lib/crypto.js';
 
 const DB_NAME = process.env.DB_NAME || 'whop_admin';
 let pool = null;
@@ -193,34 +194,87 @@ export async function updateUserPassword(userId, passwordHash) {
   await query('UPDATE users SET password_hash = ? WHERE id = ?', [passwordHash, userId]);
 }
 
-// ——— User settings (Whop API key, company ID, webhook token) ———
-export async function getUserSettings(userId) {
-  const rows = await query(
-    'SELECT whop_api_key, whop_company_id, webhook_token FROM user_settings WHERE user_id = ? LIMIT 1',
-    [userId]
-  );
-  return rows[0] || null;
+function decryptSetting(stored) {
+  if (!stored) return '';
+  try {
+    return decrypt(stored);
+  } catch (e) {
+    console.error('Failed to decrypt user setting:', e?.message);
+    return '';
+  }
 }
 
-export async function setUserSettings(userId, { whopApiKey, whopCompanyId }) {
+function encryptSetting(value) {
+  if (!value) return '';
+  return encrypt(String(value));
+}
+
+function normalizeSettingsRow(row) {
+  if (!row) return null;
+  return {
+    whop_api_key: decryptSetting(row.whop_api_key),
+    whop_company_id: row.whop_company_id || '',
+    whop_webhook_secret: decryptSetting(row.whop_webhook_secret),
+    webhook_token: row.webhook_token || '',
+  };
+}
+
+// ——— User settings (Whop API key, company ID, webhook token, webhook secret) ———
+export async function getUserSettings(userId) {
+  const rows = await query(
+    'SELECT whop_api_key, whop_company_id, whop_webhook_secret, webhook_token FROM user_settings WHERE user_id = ? LIMIT 1',
+    [userId]
+  );
+  return normalizeSettingsRow(rows[0]) || null;
+}
+
+export async function setUserSettings(userId, { whopApiKey, whopCompanyId, whopWebhookSecret }) {
   const p = getPool();
-  let row = await getUserSettings(userId);
+  const row = await getUserSettings(userId);
+  const rawRows = await query(
+    'SELECT whop_api_key, whop_webhook_secret FROM user_settings WHERE user_id = ? LIMIT 1',
+    [userId]
+  );
+  const raw = rawRows[0] || null;
+
   let webhookToken = row?.webhook_token || '';
   if (!webhookToken) {
     webhookToken = crypto.randomBytes(24).toString('hex');
   }
-  const apiKey = whopApiKey !== undefined ? String(whopApiKey).trim() : (row?.whop_api_key ?? '');
-  const companyId = whopCompanyId !== undefined ? String(whopCompanyId).trim() : (row?.whop_company_id ?? '');
+  const apiKeyPlain =
+    whopApiKey !== undefined ? String(whopApiKey).trim() : (row?.whop_api_key ?? '');
+  const companyId =
+    whopCompanyId !== undefined ? String(whopCompanyId).trim() : (row?.whop_company_id ?? '');
+  const webhookSecretPlain =
+    whopWebhookSecret !== undefined
+      ? String(whopWebhookSecret).trim()
+      : (row?.whop_webhook_secret ?? '');
+
+  let apiKeyStored = raw?.whop_api_key ?? '';
+  if (whopApiKey !== undefined) {
+    apiKeyStored = apiKeyPlain ? encryptSetting(apiKeyPlain) : '';
+  }
+  let webhookSecretStored = raw?.whop_webhook_secret ?? '';
+  if (whopWebhookSecret !== undefined) {
+    webhookSecretStored = webhookSecretPlain ? encryptSetting(webhookSecretPlain) : '';
+  }
+
   await p.execute(
-    `INSERT INTO user_settings (user_id, whop_api_key, whop_company_id, webhook_token)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO user_settings (user_id, whop_api_key, whop_company_id, whop_webhook_secret, webhook_token)
+     VALUES (?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        whop_api_key = VALUES(whop_api_key),
        whop_company_id = VALUES(whop_company_id),
+       whop_webhook_secret = IF(VALUES(whop_webhook_secret) != '', VALUES(whop_webhook_secret), whop_webhook_secret),
        webhook_token = IF(COALESCE(webhook_token, '') = '', VALUES(webhook_token), webhook_token)`,
-    [userId, apiKey, companyId, webhookToken]
+    [userId, apiKeyStored, companyId, webhookSecretStored, webhookToken]
   );
-  return { whopApiKey: apiKey, whopCompanyId, webhookToken };
+  return {
+    whopApiKey: apiKeyPlain,
+    whopCompanyId: companyId,
+    whopWebhookSecret: webhookSecretPlain,
+    webhookToken,
+  };
 }
 
 export async function getUserByWebhookToken(token) {
