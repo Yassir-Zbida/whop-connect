@@ -84,6 +84,18 @@ export async function insertActivityLog({ userId = null, email = null, action, m
   );
 }
 
+/** Delete activity log rows older than N days (default from ACTIVITY_LOG_RETENTION_DAYS env). */
+export async function purgeActivityLogsOlderThan(days) {
+  const retention =
+    days != null ? Number(days) : Number(process.env.ACTIVITY_LOG_RETENTION_DAYS) || 90;
+  const d = Math.max(1, Math.min(retention, 3650));
+  const [result] = await getPool().execute(
+    'DELETE FROM activity_log WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
+    [d]
+  );
+  return result.affectedRows || 0;
+}
+
 /**
  * Get activity logs with optional filters. No time limit – full history.
  * @param {number} limit
@@ -375,6 +387,15 @@ export async function getFullAutoSplit(userId) {
   };
 }
 
+export function validateSplitPercentages(splits) {
+  const total = (splits || []).reduce((sum, s) => sum + (Number(s.percentage) || 0), 0);
+  if (total > 100) {
+    const err = new Error('Split percentages cannot exceed 100% combined.');
+    err.code = 'SPLIT_PERCENTAGE_EXCEEDS_100';
+    throw err;
+  }
+}
+
 export async function createAutoSplitRule(userId, { productId, planId, splits }) {
   if (!splits || !splits.length) return null;
   const validSplits = splits.filter((s) => {
@@ -383,6 +404,7 @@ export async function createAutoSplitRule(userId, { productId, planId, splits })
     return dest && pct > 0;
   });
   if (!validSplits.length) return null;
+  validateSplitPercentages(validSplits);
   await assertProductNotInAutoTransfer(userId, productId);
   const id = 'rule_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
   const p = getPool();
@@ -581,4 +603,425 @@ export async function addProcessedPaymentIdAutoTransfer(userId, paymentId) {
      ON DUPLICATE KEY UPDATE processed_payment_ids = VALUES(processed_payment_ids)`,
     [userId, JSON.stringify(ids)]
   );
+}
+
+// ——— Payment job queue (webhooks + catch-up; processed by background worker) ———
+
+const DEFAULT_MAX_JOB_ATTEMPTS = Number(process.env.PAYMENT_JOB_MAX_ATTEMPTS) || 5;
+
+/** Queue a payment for split + auto-transfer processing (idempotent per user/payment). */
+export async function enqueuePaymentJob(userId, paymentId) {
+  const uid = Number(userId);
+  const pid = String(paymentId).trim();
+  if (!uid || !pid) {
+    return { queued: false, reason: 'invalid' };
+  }
+
+  const [insertResult] = await getPool().execute(
+    `INSERT INTO payment_jobs (user_id, payment_id, status, max_attempts)
+     VALUES (?, ?, 'pending', ?)
+     ON DUPLICATE KEY UPDATE
+       status = CASE
+         WHEN status = 'completed' THEN 'completed'
+         WHEN status = 'processing' THEN 'processing'
+         WHEN status = 'failed' AND attempts >= max_attempts THEN 'failed'
+         ELSE 'pending'
+       END,
+       last_error = IF(status = 'completed', last_error, NULL),
+       updated_at = CURRENT_TIMESTAMP`,
+    [uid, pid, DEFAULT_MAX_JOB_ATTEMPTS]
+  );
+
+  const rows = await query(
+    'SELECT id, status FROM payment_jobs WHERE user_id = ? AND payment_id = ? LIMIT 1',
+    [uid, pid]
+  );
+  const row = rows[0];
+  if (!row) return { queued: false, reason: 'insert_failed' };
+
+  const created = insertResult.affectedRows === 1;
+  return {
+    queued: row.status === 'pending' || row.status === 'processing',
+    jobId: row.id,
+    status: row.status,
+    created,
+    alreadyCompleted: row.status === 'completed',
+  };
+}
+
+/** Re-queue stale jobs stuck in processing (e.g. server crash). */
+export async function releaseStalePaymentJobs(staleSeconds = 120) {
+  const sec = Math.max(30, Number(staleSeconds) || 120);
+  const [result] = await getPool().execute(
+    `UPDATE payment_jobs
+     SET status = 'pending', locked_until = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE status = 'processing'
+       AND (locked_until IS NULL OR locked_until < DATE_SUB(NOW(), INTERVAL ? SECOND))`,
+    [sec]
+  );
+  return result.affectedRows || 0;
+}
+
+/** Claim a batch of pending jobs for the worker (atomic). */
+export async function claimPendingPaymentJobs(batchSize = 20) {
+  const limit = Math.min(Math.max(1, Number(batchSize) || 20), 100);
+  const lockSec = Number(process.env.PAYMENT_JOB_LOCK_SECONDS) || 180;
+
+  const connection = await getPool().getConnection();
+  try {
+    await connection.beginTransaction();
+    const [candidates] = await connection.execute(
+      `SELECT id FROM payment_jobs
+       WHERE status = 'pending'
+       ORDER BY created_at ASC
+       LIMIT ${limit}
+       FOR UPDATE SKIP LOCKED`
+    );
+    if (!candidates.length) {
+      await connection.commit();
+      return [];
+    }
+    const ids = candidates.map((r) => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    await connection.execute(
+      `UPDATE payment_jobs
+       SET status = 'processing',
+           attempts = attempts + 1,
+           locked_until = DATE_ADD(NOW(), INTERVAL ? SECOND),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders}) AND status = 'pending'`,
+      [lockSec, ...ids]
+    );
+    const [claimed] = await connection.execute(
+      `SELECT id, user_id, payment_id, attempts, max_attempts
+       FROM payment_jobs WHERE id IN (${placeholders}) AND status = 'processing'`,
+      ids
+    );
+    await connection.commit();
+    return claimed;
+  } catch (e) {
+    await connection.rollback();
+    throw e;
+  } finally {
+    connection.release();
+  }
+}
+
+export async function completePaymentJob(jobId, resultJson = null) {
+  await getPool().execute(
+    `UPDATE payment_jobs
+     SET status = 'completed', result_json = ?, locked_until = NULL, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [resultJson ? JSON.stringify(resultJson) : null, jobId]
+  );
+}
+
+export async function failPaymentJob(jobId, errorMessage, requeue = true) {
+  const msg = String(errorMessage || 'unknown').slice(0, 2000);
+  if (!requeue) {
+    await getPool().execute(
+      `UPDATE payment_jobs SET status = 'failed', last_error = ?, locked_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [msg, jobId]
+    );
+    return;
+  }
+  await getPool().execute(
+    `UPDATE payment_jobs
+     SET status = IF(attempts >= max_attempts, 'failed', 'pending'),
+         last_error = ?,
+         locked_until = NULL,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [msg, jobId]
+  );
+}
+
+export async function getPaymentJobQueueStats() {
+  const rows = await query(
+    `SELECT status, COUNT(*) AS count FROM payment_jobs GROUP BY status`
+  );
+  const stats = { pending: 0, processing: 0, completed: 0, failed: 0 };
+  for (const r of rows) {
+    stats[r.status] = Number(r.count) || 0;
+  }
+  return stats;
+}
+
+export async function getPaymentJobsByUser() {
+  const rows = await query(
+    `SELECT
+      u.id AS user_id,
+      u.email,
+      u.active,
+      COALESCE(ascfg.enabled, 0) AS auto_split_enabled,
+      COALESCE(atcfg.enabled, 0) AS auto_transfer_enabled,
+      (SELECT COUNT(*) FROM auto_split_rules r WHERE r.user_id = u.id) AS split_rules,
+      (SELECT COUNT(*) FROM auto_transfer_rules r WHERE r.user_id = u.id) AS transfer_rules,
+      COALESCE(SUM(pj.status = 'pending'), 0) AS pending,
+      COALESCE(SUM(pj.status = 'processing'), 0) AS processing,
+      COALESCE(SUM(pj.status = 'completed'), 0) AS completed,
+      COALESCE(SUM(pj.status = 'failed'), 0) AS failed,
+      COUNT(pj.id) AS total_jobs,
+      MAX(pj.updated_at) AS last_job_at
+    FROM users u
+    LEFT JOIN auto_split_config ascfg ON ascfg.user_id = u.id
+    LEFT JOIN auto_transfer_config atcfg ON atcfg.user_id = u.id
+    LEFT JOIN payment_jobs pj ON pj.user_id = u.id
+    GROUP BY u.id, u.email, u.active, ascfg.enabled, atcfg.enabled
+    HAVING total_jobs > 0 OR auto_split_enabled = 1 OR auto_transfer_enabled = 1
+       OR split_rules > 0 OR transfer_rules > 0
+    ORDER BY (pending + processing) DESC, total_jobs DESC, u.email ASC`
+  );
+  return rows.map((r) => {
+    const completed = Number(r.completed) || 0;
+    const failed = Number(r.failed) || 0;
+    const finished = completed + failed;
+    return {
+      userId: r.user_id,
+      email: r.email,
+      active: Boolean(r.active),
+      autoSplitEnabled: Boolean(r.auto_split_enabled),
+      autoTransferEnabled: Boolean(r.auto_transfer_enabled),
+      splitRules: Number(r.split_rules) || 0,
+      transferRules: Number(r.transfer_rules) || 0,
+      pending: Number(r.pending) || 0,
+      processing: Number(r.processing) || 0,
+      completed,
+      failed,
+      totalJobs: Number(r.total_jobs) || 0,
+      completionRate: finished > 0 ? Math.round((completed / finished) * 1000) / 10 : null,
+      lastJobAt: r.last_job_at,
+    };
+  });
+}
+
+export async function getPaymentJobsByDay(days = 30) {
+  const rows = await query(
+    `SELECT DATE(created_at) AS date, status, COUNT(*) AS count
+     FROM payment_jobs
+     WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY DATE(created_at), status
+     ORDER BY date ASC`,
+    [days]
+  );
+  const byDate = new Map();
+  for (const r of rows) {
+    const d = String(r.date).slice(0, 10);
+    if (!byDate.has(d)) {
+      byDate.set(d, { date: d, pending: 0, processing: 0, completed: 0, failed: 0 });
+    }
+    const entry = byDate.get(d);
+    entry[r.status] = Number(r.count) || 0;
+  }
+  return Array.from(byDate.values());
+}
+
+export async function getOldestPendingJobAgeSeconds() {
+  const [row] = await query(
+    `SELECT TIMESTAMPDIFF(SECOND, MIN(created_at), NOW()) AS age
+     FROM payment_jobs WHERE status = 'pending'`
+  );
+  if (row?.age == null) return null;
+  return Number(row.age);
+}
+
+export async function getPaymentJobsFailedSinceHours(hours = 24) {
+  const [row] = await query(
+    `SELECT COUNT(*) AS count FROM payment_jobs
+     WHERE status = 'failed' AND updated_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+    [hours]
+  );
+  return Number(row?.count) || 0;
+}
+
+function parseMeta(meta) {
+  if (meta == null) return {};
+  if (typeof meta === 'object') return meta;
+  try {
+    return JSON.parse(meta);
+  } catch {
+    return {};
+  }
+}
+
+export async function getWorkflowMetrics(days = 30) {
+  const rows = await query(
+    `SELECT user_id, email, action, meta FROM activity_log
+     WHERE action IN ('webhook_split', 'webhook_auto_transfer', 'webhook_split_error', 'webhook_enqueue')
+       AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
+    [days]
+  );
+
+  const global = {
+    splitEvents: 0,
+    splitRan: 0,
+    splitSkipped: 0,
+    transferEvents: 0,
+    transferSuccess: 0,
+    transferWithErrors: 0,
+    enqueueEvents: 0,
+  };
+  const byUser = new Map();
+
+  function userBucket(userId, email) {
+    const key = userId ?? 0;
+    if (!byUser.has(key)) {
+      byUser.set(key, {
+        userId: key,
+        email: email || null,
+        splitEvents: 0,
+        splitRan: 0,
+        splitSkipped: 0,
+        transferEvents: 0,
+        transferSuccess: 0,
+        transferWithErrors: 0,
+        enqueueEvents: 0,
+      });
+    }
+    return byUser.get(key);
+  }
+
+  for (const r of rows) {
+    const meta = parseMeta(r.meta);
+    const u = userBucket(r.user_id, r.email);
+
+    if (r.action === 'webhook_split') {
+      global.splitEvents++;
+      u.splitEvents++;
+      if (meta.ran === true) {
+        global.splitRan++;
+        u.splitRan++;
+      } else {
+        global.splitSkipped++;
+        u.splitSkipped++;
+      }
+    } else if (r.action === 'webhook_auto_transfer') {
+      global.transferEvents++;
+      u.transferEvents++;
+      const transfers = Number(meta.transfers) || 0;
+      const errors = Number(meta.errors) || 0;
+      if (transfers > 0) {
+        global.transferSuccess++;
+        u.transferSuccess++;
+      }
+      if (errors > 0) {
+        global.transferWithErrors++;
+        u.transferWithErrors++;
+      }
+    } else if (r.action === 'webhook_enqueue') {
+      global.enqueueEvents++;
+      u.enqueueEvents++;
+    }
+  }
+
+  const splitRate =
+    global.splitEvents > 0 ? Math.round((global.splitRan / global.splitEvents) * 1000) / 10 : null;
+  const transferRate =
+    global.transferEvents > 0
+      ? Math.round((global.transferSuccess / global.transferEvents) * 1000) / 10
+      : null;
+
+  const users = Array.from(byUser.values())
+    .map((u) => ({
+      ...u,
+      splitRunRate:
+        u.splitEvents > 0 ? Math.round((u.splitRan / u.splitEvents) * 1000) / 10 : null,
+      transferSuccessRate:
+        u.transferEvents > 0
+          ? Math.round((u.transferSuccess / u.transferEvents) * 1000) / 10
+          : null,
+    }))
+    .filter(
+      (u) =>
+        u.splitEvents > 0 || u.transferEvents > 0 || u.enqueueEvents > 0
+    )
+    .sort((a, b) => b.transferEvents + b.splitEvents - (a.transferEvents + a.splitEvents));
+
+  return {
+    global: {
+      ...global,
+      splitRunRate: splitRate,
+      transferSuccessRate: transferRate,
+    },
+    byUser: users,
+  };
+}
+
+export async function getWorkflowEventsByDay(days = 30) {
+  const rows = await query(
+    `SELECT DATE(created_at) AS date, action, COUNT(*) AS count
+     FROM activity_log
+     WHERE action IN ('webhook_split', 'webhook_auto_transfer')
+       AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY DATE(created_at), action
+     ORDER BY date ASC`,
+    [days]
+  );
+  const byDate = new Map();
+  for (const r of rows) {
+    const d = String(r.date).slice(0, 10);
+    if (!byDate.has(d)) {
+      byDate.set(d, { date: d, split: 0, transfer: 0 });
+    }
+    const entry = byDate.get(d);
+    if (r.action === 'webhook_split') entry.split = Number(r.count) || 0;
+    if (r.action === 'webhook_auto_transfer') entry.transfer = Number(r.count) || 0;
+  }
+  return Array.from(byDate.values());
+}
+
+/** Extended admin analytics: base stats + queue + workflow metrics. */
+export async function getAdminInsights(days = 30) {
+  const base = await getAnalyticsStats(days);
+  let queue = {
+    global: { pending: 0, processing: 0, completed: 0, failed: 0 },
+    byUser: [],
+    byDay: [],
+    oldestPendingSeconds: null,
+    failedLast24h: 0,
+    tableAvailable: true,
+  };
+  try {
+    queue.global = await getPaymentJobQueueStats();
+    queue.byUser = await getPaymentJobsByUser();
+    queue.byDay = await getPaymentJobsByDay(days);
+    queue.oldestPendingSeconds = await getOldestPendingJobAgeSeconds();
+    queue.failedLast24h = await getPaymentJobsFailedSinceHours(24);
+  } catch (e) {
+    queue.tableAvailable = false;
+    queue.error = e?.message || 'payment_jobs unavailable';
+  }
+
+  let workflows = {
+    global: {
+      splitEvents: 0,
+      splitRan: 0,
+      splitSkipped: 0,
+      transferEvents: 0,
+      transferSuccess: 0,
+      transferWithErrors: 0,
+      enqueueEvents: 0,
+      splitRunRate: null,
+      transferSuccessRate: null,
+    },
+    byUser: [],
+    byDay: [],
+  };
+  try {
+    workflows = await getWorkflowMetrics(days);
+    workflows.byDay = await getWorkflowEventsByDay(days);
+  } catch (_) {}
+
+  const finished =
+    (queue.global.completed || 0) + (queue.global.failed || 0);
+  const jobCompletionRate =
+    finished > 0
+      ? Math.round(((queue.global.completed || 0) / finished) * 1000) / 10
+      : null;
+
+  return {
+    ...base,
+    queue: { ...queue, jobCompletionRate },
+    workflows,
+  };
 }
