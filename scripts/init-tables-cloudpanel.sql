@@ -10,7 +10,7 @@
 -- Set DB_NAME=whooop-app in .env to match.
 -- =============================================================================
 
-USE `whoop-app`;
+USE `whooop-app`;
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
@@ -169,4 +169,4 @@ CREATE TABLE sessions (
 
 SET FOREIGN_KEY_CHECKS = 1;
 
-SELECT 'whooop-app tables initialized successfully.' AS status;
+SELECT 'whooop-app tables reset and created successfully.' AS status;
