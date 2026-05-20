@@ -21,6 +21,7 @@ export function getPool() {
       user,
       password,
       database,
+      charset: 'utf8mb4',
       waitForConnections: true,
       connectionLimit: 10,
       queueLimit: 0,
@@ -77,10 +78,23 @@ export async function updateUserActive(userId, active) {
 }
 
 // ——— Activity log (for admin dashboard) ———
+function toJsonParam(value) {
+  if (value == null) return null;
+  return JSON.stringify(value);
+}
+
 export async function insertActivityLog({ userId = null, email = null, action, message = '', meta = null }) {
+  const metaJson = toJsonParam(meta);
+  if (metaJson == null) {
+    await getPool().execute(
+      'INSERT INTO activity_log (user_id, email, action, message, meta) VALUES (?, ?, ?, ?, NULL)',
+      [userId, email || null, String(action).slice(0, 128), String(message).slice(0, 512)]
+    );
+    return;
+  }
   await getPool().execute(
-    'INSERT INTO activity_log (user_id, email, action, message, meta) VALUES (?, ?, ?, ?, ?)',
-    [userId, email || null, String(action).slice(0, 128), String(message).slice(0, 512), meta ? JSON.stringify(meta) : null]
+    'INSERT INTO activity_log (user_id, email, action, message, meta) VALUES (?, ?, ?, ?, CAST(? AS JSON))',
+    [userId, email || null, String(action).slice(0, 128), String(message).slice(0, 512), metaJson]
   );
 }
 
