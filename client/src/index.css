@@ -673,7 +673,6 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  border-bottom: 1px solid var(--border);
   padding-bottom: 12px;
 }
 .admin-tab {

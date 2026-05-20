@@ -1,70 +1,14 @@
-import { useState, useEffect } from 'react';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink } from 'react-router-dom';
 import { Icon, IconPaths } from './Icon';
-import { getSettings } from '../api';
 
 type Props = { user: { id: number; email: string; role?: 'user' | 'admin' }; onLogout: () => void };
 
 export default function DashboardLayout({ user, onLogout }: Props) {
-  const navigate = useNavigate();
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
-  const [whopConfigured, setWhopConfigured] = useState(false);
-
-  const loadSettings = () => {
-    getSettings()
-      .then((s) => {
-        setSettingsLoaded(true);
-        setWhopConfigured(Boolean(s.whopApiKeySet && s.whopCompanyIdSet));
-      })
-      .catch(() => {
-        setSettingsLoaded(true);
-        setWhopConfigured(false);
-      });
-  };
-
-  useEffect(() => {
-    loadSettings();
-  }, []);
-
-  useEffect(() => {
-    const onSaved = () => loadSettings();
-    window.addEventListener('whop-settings-saved', onSaved);
-    return () => window.removeEventListener('whop-settings-saved', onSaved);
-  }, []);
-
   const navClass = ({ isActive }: { isActive: boolean }) =>
     `nav-item${isActive ? ' active' : ''}`;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
-      {settingsLoaded && !whopConfigured && (
-        <div
-          className="setup-required-banner"
-          style={{
-            flexShrink: 0,
-            background: 'var(--accent-dim)',
-            borderBottom: '1px solid var(--accent-border)',
-            padding: '12px 24px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 16,
-            flexWrap: 'wrap',
-          }}
-        >
-          <span style={{ color: 'var(--text)', fontSize: 14, fontWeight: 500 }}>
-            Please set your Whop API key and Company ID in Settings before using the app.
-          </span>
-          <button
-            type="button"
-            className="btn btn-primary btn-sm"
-            onClick={() => navigate('/settings')}
-          >
-            Go to Settings
-          </button>
-        </div>
-      )}
-      <div className="dashboard" style={{ flex: 1, minHeight: 0 }}>
+    <div className="dashboard" style={{ height: '100vh', overflow: 'hidden' }}>
       <aside className="sidebar">
         <div className="sidebar-logo">
           <img src="/whop-icon.svg" alt="Whop" className="logo-mark logo-img" style={{ width: 40, height: 40 }} />
@@ -178,7 +122,6 @@ export default function DashboardLayout({ user, onLogout }: Props) {
       </aside>
 
       <Outlet context={{ user }} />
-      </div>
     </div>
   );
 }
