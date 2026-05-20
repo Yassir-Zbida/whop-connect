@@ -272,11 +272,18 @@ export async function getPayments(): Promise<{
   return request<{ data: PaymentSummary[]; processedPaymentIds: string[] }>('/api/payments');
 }
 
-export async function processPayments(): Promise<{ processed: number; skipped: number; errors: Array<{ payment_id: string; message: string }> }> {
-  return request<{ processed: number; skipped: number; errors: Array<{ payment_id: string; message: string }> }>(
-    '/api/process-payments',
-    { method: 'POST' }
-  );
+export async function processPayments(): Promise<{
+  queued: number;
+  skipped: number;
+  errors: Array<{ payment_id: string; message: string }>;
+  message?: string;
+}> {
+  return request<{
+    queued: number;
+    skipped: number;
+    errors: Array<{ payment_id: string; message: string }>;
+    message?: string;
+  }>('/api/process-payments', { method: 'POST' });
 }
 
 // ——— Auto-transfer workflow ———
@@ -322,14 +329,17 @@ export async function deleteAutoTransferRule(id: string): Promise<{ ok: boolean;
 }
 
 export async function processPaymentsAutoTransfer(): Promise<{
-  processed: number;
+  queued: number;
   skipped: number;
   errors: Array<{ payment_id: string; message: string }>;
+  message?: string;
 }> {
-  return request<{ processed: number; skipped: number; errors: Array<{ payment_id: string; message: string }> }>(
-    '/api/process-payments-auto-transfer',
-    { method: 'POST' }
-  );
+  return request<{
+    queued: number;
+    skipped: number;
+    errors: Array<{ payment_id: string; message: string }>;
+    message?: string;
+  }>('/api/process-payments-auto-transfer', { method: 'POST' });
 }
 
 // ——— Settings ———
@@ -392,6 +402,37 @@ export type AdminLogsFilters = {
   action?: string;
 };
 
+export type QueueUserStats = {
+  userId: number;
+  email: string;
+  active: boolean;
+  autoSplitEnabled: boolean;
+  autoTransferEnabled: boolean;
+  splitRules: number;
+  transferRules: number;
+  pending: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  totalJobs: number;
+  completionRate: number | null;
+  lastJobAt: string | null;
+};
+
+export type WorkflowUserMetrics = {
+  userId: number;
+  email: string | null;
+  splitEvents: number;
+  splitRan: number;
+  splitSkipped: number;
+  transferEvents: number;
+  transferSuccess: number;
+  transferWithErrors: number;
+  enqueueEvents: number;
+  splitRunRate: number | null;
+  transferSuccessRate: number | null;
+};
+
 export type AdminAnalytics = {
   usersTotal: number;
   signupsByDay: Array<{ date: string; count: number }>;
@@ -404,11 +445,72 @@ export type AdminAnalytics = {
     transferCreatesInPeriod: number;
   };
   transferCreatesByDay?: Array<{ date: string; count: number }>;
+  queue?: {
+    global: { pending: number; processing: number; completed: number; failed: number };
+    byUser: QueueUserStats[];
+    byDay: Array<{ date: string; pending: number; processing: number; completed: number; failed: number }>;
+    oldestPendingSeconds: number | null;
+    failedLast24h: number;
+    jobCompletionRate: number | null;
+    tableAvailable?: boolean;
+    error?: string;
+  };
+  workflows?: {
+    global: {
+      splitEvents: number;
+      splitRan: number;
+      splitSkipped: number;
+      transferEvents: number;
+      transferSuccess: number;
+      transferWithErrors: number;
+      enqueueEvents: number;
+      splitRunRate: number | null;
+      transferSuccessRate: number | null;
+    };
+    byUser: WorkflowUserMetrics[];
+    byDay: Array<{ date: string; split: number; transfer: number }>;
+  };
+  worker?: {
+    enabled: boolean;
+    pollMs: number;
+    batchSize: number;
+    globalConcurrency: number;
+    staleSeconds: number;
+  };
+  workerStatus?: {
+    pollTimerActive: boolean;
+    batchRunning: boolean;
+    wakePending: boolean;
+  };
+};
+
+export type HealthCheck = {
+  id: string;
+  name: string;
+  status: 'healthy' | 'degraded' | 'warning' | 'critical';
+  message: string;
+  details?: Record<string, unknown>;
+};
+
+export type SystemHealth = {
+  status: 'healthy' | 'degraded' | 'critical';
+  timestamp: string;
+  uptimeSeconds: number;
+  nodeEnv: string;
+  checks: HealthCheck[];
+  queue: { pending: number; processing: number; completed: number; failed: number } | null;
+  worker: Record<string, unknown>;
+  encryptionConfigured: boolean;
+  failedJobs24h: number;
 };
 
 export async function getAdminAnalytics(days?: number): Promise<AdminAnalytics> {
   const params = days != null ? `?days=${days}` : '';
   return request<AdminAnalytics>(`/api/admin/analytics${params}`);
+}
+
+export async function getAdminHealth(): Promise<SystemHealth> {
+  return request<SystemHealth>('/api/admin/health');
 }
 
 export async function getAdminLogs(

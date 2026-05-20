@@ -1,12 +1,11 @@
 import { useState, useEffect } from 'react';
-import { Outlet, NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { Icon, IconPaths } from './Icon';
 import { getSettings } from '../api';
 
 type Props = { user: { id: number; email: string; role?: 'user' | 'admin' }; onLogout: () => void };
 
 export default function DashboardLayout({ user, onLogout }: Props) {
-  const location = useLocation();
   const navigate = useNavigate();
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [whopConfigured, setWhopConfigured] = useState(false);
@@ -25,7 +24,7 @@ export default function DashboardLayout({ user, onLogout }: Props) {
 
   useEffect(() => {
     loadSettings();
-  }, [location.pathname]);
+  }, []);
 
   useEffect(() => {
     const onSaved = () => loadSettings();
@@ -38,7 +37,7 @@ export default function DashboardLayout({ user, onLogout }: Props) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
-      {settingsLoaded && !whopConfigured && user.role !== 'admin' && (
+      {settingsLoaded && !whopConfigured && (
         <div
           className="setup-required-banner"
           style={{
@@ -46,7 +45,7 @@ export default function DashboardLayout({ user, onLogout }: Props) {
             background: 'var(--accent-dim)',
             borderBottom: '1px solid var(--accent-border)',
             padding: '12px 24px',
-            display: 'none',
+            display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             gap: 16,
@@ -90,11 +89,23 @@ export default function DashboardLayout({ user, onLogout }: Props) {
                 </span>
                 Users
               </NavLink>
+              <NavLink to="/system-health" className={navClass}>
+                <span className="nav-icon">
+                  <Icon d={IconPaths.shield} size={14} />
+                </span>
+                System health
+              </NavLink>
               <NavLink to="/logs" className={navClass}>
                 <span className="nav-icon">
                   <Icon d={IconPaths.terminal} size={14} />
                 </span>
                 Logs
+              </NavLink>
+              <NavLink to="/settings" className={navClass}>
+                <span className="nav-icon">
+                  <Icon d={IconPaths.settings} size={14} />
+                </span>
+                Settings
               </NavLink>
             </>
           ) : (

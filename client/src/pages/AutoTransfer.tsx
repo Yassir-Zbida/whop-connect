@@ -111,10 +111,10 @@ export default function AutoTransfer() {
     setMsg(null);
     processPaymentsAutoTransfer()
       .then((res) => {
-        const text = `Processed ${res.processed} payment(s), skipped ${res.skipped}.${res.errors?.length ? ` ${res.errors.length} error(s).` : ''}`;
+        const text = `Queued ${res.queued} payment(s), skipped ${res.skipped}.${res.errors?.length ? ` ${res.errors.length} error(s).` : ''} Processing in background.`;
         setMsg({ text, error: res.errors?.length > 0 });
         if (res.errors?.length) logError('Process payments (auto-transfer)', text, { errors: res.errors });
-        else logSuccess('Process payments (auto-transfer)', text, { processed: res.processed, skipped: res.skipped });
+        else logSuccess('Process payments (auto-transfer)', text, { queued: res.queued, skipped: res.skipped });
         showToast(text, res.errors?.length ? 'error' : 'success');
         load();
       })

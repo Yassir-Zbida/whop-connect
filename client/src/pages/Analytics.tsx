@@ -17,6 +17,14 @@ import { Bar, Line, Doughnut } from 'react-chartjs-2';
 import { Icon, IconPaths } from '../components/Icon';
 import { getMe, getAdminAnalytics } from '../api';
 import type { AdminAnalytics } from '../api';
+import {
+  WorkflowKpis,
+  QueuePanel,
+  WorkflowsPanel,
+  UsersDetailPanel,
+} from '../components/admin/AnalyticsPanels';
+
+type AnalyticsTab = 'overview' | 'queues' | 'workflows' | 'users';
 
 ChartJS.register(
   CategoryScale,
@@ -59,6 +67,7 @@ export default function Analytics() {
   const [data, setData] = useState<AdminAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
   const [days, setDays] = useState(30);
+  const [tab, setTab] = useState<AnalyticsTab>('overview');
 
   useEffect(() => {
     getMe()
@@ -282,7 +291,7 @@ export default function Analytics() {
       <div className="topbar">
         <div style={{ display: 'flex', alignItems: 'center' }}>
           <span className="topbar-title">Analytics</span>
-          <span className="topbar-sub">· Admin overview</span>
+          <span className="topbar-sub">· Metrics & queues</span>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <select
@@ -298,6 +307,27 @@ export default function Analytics() {
         </div>
       </div>
 
+
+      <div className="admin-tabs" style={{ padding: '0 24px', marginTop: 8 }}>
+        {(
+          [
+            ['overview', 'Overview'],
+            ['queues', 'Payment queue'],
+            ['workflows', 'Split & transfer'],
+            ['users', 'User detail'],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            className={`admin-tab${tab === id ? ' active' : ''}`}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       <div className="content" style={{ padding: 24 }}>
         {loading ? (
           <div className="card">
@@ -311,8 +341,15 @@ export default function Analytics() {
               <p style={{ color: 'var(--red)' }}>Failed to load analytics.</p>
             </div>
           </div>
+        ) : tab === 'queues' ? (
+          <QueuePanel data={data} />
+        ) : tab === 'workflows' ? (
+          <WorkflowsPanel data={data} />
+        ) : tab === 'users' ? (
+          <UsersDetailPanel data={data} />
         ) : (
           <>
+            <WorkflowKpis data={data} />
             <div
               style={{
                 display: 'grid',

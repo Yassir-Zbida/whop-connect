@@ -3,7 +3,7 @@ import { flushSync } from 'react-dom';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { fetchCsrfToken, getMe, logout } from './api';
 import { useToast } from './context/ToastContext';
-import { logSuccess, logInfo } from './utils/logger';
+import { logSuccess, logInfo, logError } from './utils/logger';
 import Login from './pages/Login';
 import Signup from './pages/Signup';
 import ConnectedAccounts from './pages/ConnectedAccounts';
@@ -17,6 +17,7 @@ import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import Admin from './pages/Admin';
 import Analytics from './pages/Analytics';
+import SystemHealth from './pages/SystemHealth';
 import DashboardLayout from './components/DashboardLayout';
 
 export default function App() {
@@ -44,9 +45,14 @@ export default function App() {
   useEffect(() => {
     logInfo('App', 'Application started');
     fetchCsrfToken()
-      .catch(() => {})
+      .catch((err) => {
+        const msg =
+          err instanceof Error ? err.message : 'Could not load security token. Refresh the page.';
+        logError('Security', msg);
+        showToast(msg, 'error');
+      })
       .finally(() => refreshUser().finally(() => setLoading(false)));
-  }, []);
+  }, [showToast]);
 
   const onLogin = (userFromResponse?: { id: number; email: string; role?: 'user' | 'admin' } | null) => {
     if (userFromResponse) {
@@ -113,6 +119,7 @@ export default function App() {
       >
         <Route index element={<Navigate to={user?.role === 'admin' ? '/analytics' : '/connected-accounts'} replace />} />
         <Route path="analytics" element={user?.role === 'admin' ? <Analytics /> : <Navigate to="/" replace />} />
+        <Route path="system-health" element={user?.role === 'admin' ? <SystemHealth /> : <Navigate to="/" replace />} />
         <Route path="connected-accounts" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <ConnectedAccounts />} />
         <Route path="transactions" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Transactions />} />
         <Route path="transfer-funds" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <SimpleTransfer />} />
@@ -121,7 +128,7 @@ export default function App() {
         <Route path="products" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Products />} />
         <Route path="members" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Members />} />
         <Route path="logs" element={user?.role === 'admin' ? <Logs /> : <Navigate to="/" replace />} />
-        <Route path="settings" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Settings />} />
+        <Route path="settings" element={<Settings />} />
         <Route path="admin" element={user?.role === 'admin' ? <Admin /> : <Navigate to="/" replace />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

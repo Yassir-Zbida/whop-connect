@@ -116,10 +116,10 @@ export default function AutoSplit() {
     setMsg(null);
     processPayments()
       .then((res) => {
-        const text = `Processed ${res.processed} payment(s), skipped ${res.skipped}.${res.errors?.length ? ` ${res.errors.length} error(s).` : ''}`;
+        const text = `Queued ${res.queued} payment(s), skipped ${res.skipped}.${res.errors?.length ? ` ${res.errors.length} error(s).` : ''} Processing in background.`;
         setMsg({ text, error: res.errors?.length > 0 });
-        if (res.errors?.length) logError('Process payments', text, { processed: res.processed, skipped: res.skipped, errors: res.errors });
-        else logSuccess('Process payments', text, { processed: res.processed, skipped: res.skipped });
+        if (res.errors?.length) logError('Process payments', text, { queued: res.queued, skipped: res.skipped, errors: res.errors });
+        else logSuccess('Process payments', text, { queued: res.queued, skipped: res.skipped });
         showToast(text, res.errors?.length ? 'error' : 'success');
         load();
       })
@@ -168,6 +168,13 @@ export default function AutoSplit() {
       const text = 'Add at least one destination with a percentage.';
       setMsg({ text, error: true });
       logError('Add split rule', text);
+      showToast(text, 'error');
+      return;
+    }
+    const totalPct = splits.reduce((sum, s) => sum + s.percentage, 0);
+    if (totalPct > 100) {
+      const text = 'Split percentages cannot exceed 100% combined.';
+      setMsg({ text, error: true });
       showToast(text, 'error');
       return;
     }
