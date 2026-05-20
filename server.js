@@ -24,35 +24,42 @@ import express from 'express';
 import session from 'express-session';
 import helmet from 'helmet';
 import bcrypt from 'bcrypt';
-import Whop from '@whop/sdk';
 import { Webhook } from 'standardwebhooks';
 import * as db from './db.js';
 import { encodeWebhookKeyForSdk, ensureEncryptionKey } from './lib/crypto.js';
 import {
-  allowSharedWhopEnvFallback,
   ensureSessionSecret,
   isAdminEmailPromotionAllowed,
   isRegistrationAllowed,
   validatePassword,
 } from './lib/security.js';
 import {
-  apiRateLimiter,
-  authRateLimiter,
   captureRawBody,
   csrfProtection,
   ensureCsrfToken,
   regenerateSession,
 } from './lib/middleware.js';
+import { buildSessionOptions } from './lib/session-store.js';
 import {
   companyBelongsToParent,
   productBelongsToCompany,
   transferBelongsToCompany,
 } from './lib/whop-access.js';
+import { getWhop, getWhopCompanyId, getWhopConfig } from './lib/whop-service.js';
+import {
+  getWorkerConfig,
+  getWorkerStatus,
+  startPaymentWorker,
+  wakePaymentWorker,
+} from './lib/payment-worker.js';
+import { collectSystemHealth } from './lib/system-health.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
-const USE_SECURE_COOKIES = process.env.COOKIE_SECURE === 'true';
+const USE_SECURE_COOKIES =
+  process.env.COOKIE_SECURE === 'true' ||
+  (isProduction && process.env.COOKIE_SECURE !== 'false');
 const SESSION_SECRET = ensureSessionSecret(isProduction);
 ensureEncryptionKey(isProduction);
 
@@ -80,47 +87,32 @@ function requireAdmin(req, res, next) {
   return res.status(403).json({ error: 'Forbidden', message: 'Admin access required.' });
 }
 
-async function ensureSessionRole(req) {
-  if (!req.session?.user?.id) return;
-  const u = await db.getUserById(req.session.user.id);
-  if (u) {
-    const role = u.role === 'admin' ? 'admin' : 'user';
-    if (req.session.user.role !== role) {
-      req.session.user.role = role;
-    }
-  }
-}
-
-async function getWhopConfig(userId) {
-  if (!userId) return { apiKey: '', companyId: '' };
-  const s = await db.getUserSettings(userId);
-  const fromDb = {
-    apiKey: (s?.whop_api_key || '').trim(),
-    companyId: (s?.whop_company_id || '').trim(),
-  };
-  if (fromDb.apiKey && fromDb.companyId) {
-    return fromDb;
-  }
-  if (allowSharedWhopEnvFallback()) {
-    return {
-      apiKey: fromDb.apiKey || (process.env.WHOP_API_KEY || '').trim(),
-      companyId: fromDb.companyId || (process.env.WHOP_PARENT_COMPANY_ID || '').trim(),
-    };
-  }
-  return fromDb;
-}
-
-function getWhop(userId) {
-  if (!userId) return null;
-  return getWhopConfig(userId).then((c) => {
-    if (c.apiKey && c.companyId) return new Whop({ apiKey: c.apiKey });
-    return null;
+function destroySession(req) {
+  return new Promise((resolve) => {
+    req.session.destroy(() => resolve());
   });
 }
 
-async function getWhopCompanyId(userId) {
-  const c = await getWhopConfig(userId);
-  return c.companyId;
+async function ensureSessionUser(req) {
+  if (!req.session?.user?.id) return { ok: false, reason: 'no_session' };
+  const u = await db.getUserById(req.session.user.id);
+  if (!u) {
+    await destroySession(req);
+    return { ok: false, reason: 'user_not_found' };
+  }
+  if (!u.active) {
+    await destroySession(req);
+    return { ok: false, reason: 'deactivated' };
+  }
+  const role = u.role === 'admin' ? 'admin' : 'user';
+  if (req.session.user.role !== role) {
+    req.session.user.role = role;
+  }
+  return { ok: true, user: u };
+}
+
+async function ensureSessionRole(req) {
+  await ensureSessionUser(req);
 }
 
 /** Normalize Whop API errors: return { status, message } for response. 502 + friendly message for 4xx auth. */
@@ -221,36 +213,38 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 
-app.use(
-  session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: true,
-    name: 'whop.sid',
-    cookie: {
-      httpOnly: true,
-      secure: USE_SECURE_COOKIES,
-      sameSite: 'strict',
-      maxAge: 24 * 60 * 60 * 1000,
-      path: '/',
-    },
-  })
-);
+app.use(session(buildSessionOptions(SESSION_SECRET, USE_SECURE_COOKIES)));
 
 // Public assets
 app.use(express.static(path.join(__dirname, 'public')));
 
-function requireAuth(req, res, next) {
-  if (req.session?.user?.id) return next();
-  if (req.xhr || req.headers.accept?.includes('application/json')) {
-    return res.status(401).json({ error: 'Unauthorized', message: 'Please log in.' });
+async function requireAuth(req, res, next) {
+  if (!req.session?.user?.id) {
+    if (req.xhr || req.headers.accept?.includes('application/json')) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Please log in.' });
+    }
+    return res.redirect('/login');
   }
-  return res.redirect('/login');
+  try {
+    const check = await ensureSessionUser(req);
+    if (!check.ok) {
+      if (check.reason === 'deactivated') {
+        return res.status(403).json({
+          error: 'Account deactivated',
+          message: 'Your account has been deactivated. Contact an administrator.',
+        });
+      }
+      return res.status(401).json({ error: 'Unauthorized', message: 'Please log in.' });
+    }
+    return next();
+  } catch (e) {
+    console.error('requireAuth error:', e?.message);
+    return res.status(500).json({ error: 'Server error', message: 'Could not verify session.' });
+  }
 }
 
 // ——— API router (mounted at /api) ———
 const api = express.Router();
-api.use(apiRateLimiter);
 api.use(csrfProtection);
 
 api.get('/csrf', (req, res) => {
@@ -259,15 +253,21 @@ api.get('/csrf', (req, res) => {
 });
 
 api.get('/me', async (req, res) => {
-  await ensureSessionRole(req);
-  const u = req.session?.user;
+  if (!req.session?.user?.id) {
+    return res.json({ user: null });
+  }
+  const check = await ensureSessionUser(req);
+  if (!check.ok) {
+    return res.json({ user: null });
+  }
+  const u = req.session.user;
   if (u && (u.role === undefined || u.role === null)) {
     u.role = 'user';
   }
   return res.json({ user: u ?? null });
 });
 
-api.post('/register', authRateLimiter, async (req, res) => {
+api.post('/register', async (req, res) => {
   if (!isRegistrationAllowed()) {
     return res.status(403).json({
       error: 'Registration disabled',
@@ -287,7 +287,10 @@ api.post('/register', authRateLimiter, async (req, res) => {
   try {
     const existing = await db.findUserByEmail(e);
     if (existing) {
-      return res.status(409).json({ error: 'Email already registered', message: 'Use login instead.' });
+      return res.status(400).json({
+        error: 'Invalid request',
+        message: 'Could not create account. If you already have an account, try logging in.',
+      });
     }
     const role =
       isAdminEmailPromotionAllowed() && ADMIN_EMAIL && e === ADMIN_EMAIL ? 'admin' : 'user';
@@ -307,7 +310,7 @@ api.post('/register', authRateLimiter, async (req, res) => {
   }
 });
 
-api.post('/login', authRateLimiter, async (req, res) => {
+api.post('/login', async (req, res) => {
   const { email, password } = req.body || {};
   const e = email != null ? String(email).trim().toLowerCase() : '';
   const p = password != null ? String(password) : '';
@@ -840,138 +843,6 @@ api.get('/products/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ——— Auto-split workflow (per user, from DB) ———
-async function runSplitForPayment(paymentId, userId) {
-  const whop = await getWhop(userId);
-  const companyId = await getWhopCompanyId(userId);
-  const state = await db.getFullAutoSplit(userId);
-  if (state.processedPaymentIds.includes(paymentId)) return { ran: false, reason: 'already_processed' };
-  if (!whop || !companyId) return { ran: false, reason: 'not_configured' };
-  if (!state.enabled || state.rules.length === 0) return { ran: false, reason: 'disabled_or_no_rules' };
-
-  let payment;
-  try {
-    payment = await whop.payments.retrieve(paymentId);
-  } catch (e) {
-    return { ran: false, reason: 'payment_fetch_failed', message: e?.message };
-  }
-
-  const status = payment?.status;
-  if (status !== 'paid') return { ran: false, reason: 'payment_not_paid', status };
-
-  const productId = payment?.product?.id ?? null;
-  const planId = payment?.plan?.id ?? null;
-  const amountRaw = payment?.amount_after_fees ?? payment?.total ?? payment?.usd_total ?? 0;
-  const amount = Number(amountRaw);
-  const currency = (payment?.currency || 'usd').toLowerCase();
-  if (!amount || amount <= 0) return { ran: false, reason: 'invalid_amount' };
-
-  const matchingRules = state.rules.filter((r) => {
-    if (r.productId && r.productId !== productId) return false;
-    if (r.planId != null && r.planId !== '' && r.planId !== planId) return false;
-    return true;
-  });
-  if (matchingRules.length === 0) return { ran: false, reason: 'no_matching_rule', productId, planId };
-
-  const transfersCreated = [];
-  const errors = [];
-  for (const rule of matchingRules) {
-    for (const split of rule.splits || []) {
-      const pct = Number(split.percentage);
-      const destId = split.destination_id?.trim();
-      if (!destId || !Number.isFinite(pct) || pct <= 0) continue;
-      const splitAmount = Math.round((amount * pct) / 100 * 100) / 100;
-      if (splitAmount < 0.01) continue;
-      try {
-        const transfer = await whop.transfers.create({
-          amount: splitAmount,
-          currency,
-          origin_id: companyId,
-          destination_id: destId,
-          metadata: { payment_id: paymentId, product_id: productId || '', rule_id: rule.id || '', percentage: pct },
-        });
-        transfersCreated.push({ transfer_id: transfer.id, destination_id: destId, amount: splitAmount, percentage: pct });
-      } catch (e) {
-        errors.push({ destination_id: destId, message: e?.message || String(e) });
-      }
-    }
-  }
-
-  await db.addProcessedPaymentId(userId, paymentId);
-  return { ran: true, transfersCreated, errors };
-}
-
-// ——— Auto-transfer: on payment match, send % or fixed amount to any destination ———
-async function runAutoTransferForPayment(paymentId, userId) {
-  const whop = await getWhop(userId);
-  const companyId = await getWhopCompanyId(userId);
-  const state = await db.getFullAutoTransfer(userId);
-  if (state.processedPaymentIds.includes(paymentId)) return { ran: false, reason: 'already_processed' };
-  if (!whop || !companyId) return { ran: false, reason: 'not_configured' };
-  if (!state.enabled || state.rules.length === 0) return { ran: false, reason: 'disabled_or_no_rules' };
-
-  let payment;
-  try {
-    payment = await whop.payments.retrieve(paymentId);
-  } catch (e) {
-    return { ran: false, reason: 'payment_fetch_failed', message: e?.message };
-  }
-
-  if (payment?.status !== 'paid') return { ran: false, reason: 'payment_not_paid', status: payment?.status };
-  const productId = payment?.product?.id ?? null;
-  const planId = payment?.plan?.id ?? null;
-  const amountRaw = payment?.amount_after_fees ?? payment?.total ?? payment?.usd_total ?? 0;
-  const amount = Number(amountRaw);
-  const currency = (payment?.currency || 'usd').toLowerCase();
-  if (!amount || amount <= 0) return { ran: false, reason: 'invalid_amount' };
-
-  const matchingRules = state.rules.filter((r) => {
-    if (r.productId && r.productId !== productId) return false;
-    if (r.planId != null && r.planId !== '' && r.planId !== planId) return false;
-    return true;
-  });
-  if (matchingRules.length === 0) return { ran: false, reason: 'no_matching_rule', productId, planId };
-
-  const transfersCreated = [];
-  const errors = [];
-  for (const rule of matchingRules) {
-    const destId = rule.destination_id?.trim();
-    if (!destId) continue;
-    let transferAmount;
-    if (rule.transfer_type === 'fixed') {
-      transferAmount = Math.min(Number(rule.value) || 0, amount);
-    } else {
-      transferAmount = Math.round((amount * (Number(rule.value) || 0)) / 100 * 100) / 100;
-    }
-    if (!Number.isFinite(transferAmount) || transferAmount < 0.01) continue;
-    try {
-      const transfer = await whop.transfers.create({
-        amount: transferAmount,
-        currency,
-        origin_id: companyId,
-        destination_id: destId,
-        metadata: {
-          payment_id: paymentId,
-          product_id: productId || '',
-          rule_id: rule.id || '',
-          transfer_type: rule.transfer_type,
-          value: rule.value,
-        },
-      });
-      transfersCreated.push({ transfer_id: transfer.id, destination_id: destId, amount: transferAmount, rule_id: rule.id });
-    } catch (e) {
-      const errMsg = e?.message || String(e);
-      errors.push({ destination_id: destId, rule_id: rule.id, message: errMsg });
-      console.error(`[auto-transfer] Failed payment=${paymentId} dest=${destId}: ${errMsg}`);
-    }
-  }
-
-  if (transfersCreated.length > 0 || errors.length === 0) {
-    await db.addProcessedPaymentIdAutoTransfer(userId, paymentId);
-  }
-  return { ran: true, transfersCreated, errors };
-}
-
 // Split rules API (protected, per user)
 api.get('/split-rules', requireAuth, async (req, res) => {
   const userId = getUserId(req);
@@ -1010,6 +881,9 @@ api.post('/split-rules', requireAuth, async (req, res) => {
   } catch (e) {
     if (e?.code === 'PRODUCT_IN_AUTO_TRANSFER') {
       return res.status(409).json({ error: 'Conflict', message: e.message, code: e.code });
+    }
+    if (e?.code === 'SPLIT_PERCENTAGE_EXCEEDS_100') {
+      return res.status(400).json({ error: 'Invalid request', message: e.message, code: e.code });
     }
     throw e;
   }
@@ -1056,8 +930,14 @@ api.get('/auto-transfer', requireAuth, async (req, res) => {
       processedPaymentIds: (state.processedPaymentIds || []).slice(-500),
     });
   } catch (e) {
-    console.error('GET /api/auto-transfer failed (run migrate-auto-transfer.sql if tables are missing):', e?.message);
-    return res.json({
+    const msg = e?.message || 'Failed to load auto-transfer config';
+    console.error('GET /api/auto-transfer failed:', msg);
+    const missingTable = /auto_transfer|doesn't exist|ER_NO_SUCH_TABLE|Unknown table/i.test(msg);
+    return res.status(missingTable ? 503 : 500).json({
+      error: missingTable ? 'Not configured' : 'Server error',
+      message: missingTable
+        ? 'Auto-transfer tables are missing. Run scripts/migrate-auto-transfer.sql'
+        : msg,
       enabled: false,
       rules: [],
       processedPaymentIds: [],
@@ -1141,9 +1021,10 @@ api.post('/process-payments-auto-transfer', requireAuth, async (req, res) => {
       message: 'Set Whop API key and Company ID in Settings',
     });
   }
-  const state = await db.getFullAutoTransfer(userId);
-  const processed = new Set(state.processedPaymentIds);
-  const results = { processed: 0, skipped: 0, errors: [] };
+  const splitState = await db.getFullAutoSplit(userId);
+  const transferState = await db.getFullAutoTransfer(userId);
+  const processed = new Set([...splitState.processedPaymentIds, ...transferState.processedPaymentIds]);
+  const results = { queued: 0, skipped: 0, errors: [] };
   try {
     const page = await whop.payments.list({
       company_id: companyId,
@@ -1158,13 +1039,15 @@ api.post('/process-payments-auto-transfer', requireAuth, async (req, res) => {
         continue;
       }
       try {
-        const result = await runAutoTransferForPayment(p.id, userId);
-        if (result.ran) results.processed++;
+        const q = await db.enqueuePaymentJob(userId, p.id);
+        if (q.queued) results.queued++;
+        else results.skipped++;
       } catch (e) {
         results.errors.push({ payment_id: p.id, message: e?.message });
       }
     }
-    return res.json(results);
+    wakePaymentWorker();
+    return res.json({ ...results, message: 'Payments queued for background processing.' });
   } catch (err) {
     const message = err?.message || err?.toString?.() || 'Failed to list payments';
     return res.status(500).json({
@@ -1238,43 +1121,23 @@ api.post('/webhooks/whop/:token', async (req, res) => {
     return res.status(200).json({ received: true });
   }
   try {
-    const splitResult = await runSplitForPayment(paymentId, user.id);
-    try {
-      await db.insertActivityLog({
-        userId: user.id,
-        email: u?.email,
-        action: 'webhook_split',
-        message: splitResult.ran ? `Split ran for payment ${paymentId}` : `Split skipped: ${splitResult.reason || 'unknown'}`,
-        meta: { payment_id: paymentId, ran: splitResult.ran, reason: splitResult.reason, transfers: splitResult.transfersCreated?.length },
-      });
-    } catch (_) {}
-    let autoTransferResult = { ran: false };
-    try {
-      autoTransferResult = await runAutoTransferForPayment(paymentId, user.id);
-      if (autoTransferResult.ran && (autoTransferResult.transfersCreated?.length || autoTransferResult.errors?.length)) {
-        await db.insertActivityLog({
-          userId: user.id,
-          email: u?.email,
-          action: 'webhook_auto_transfer',
-          message: `Auto-transfer ran for payment ${paymentId}`,
-          meta: {
-            payment_id: paymentId,
-            transfers: autoTransferResult.transfersCreated?.length ?? 0,
-            errors: autoTransferResult.errors?.length ?? 0,
-            error_details: autoTransferResult.errors ?? [],
-          },
-        });
-      }
-    } catch (_) {}
-    return res.status(200).json({ received: true, split: splitResult, autoTransfer: autoTransferResult });
+    const queued = await db.enqueuePaymentJob(user.id, paymentId);
+    wakePaymentWorker();
+    return res.status(200).json({
+      received: true,
+      queued: queued.queued,
+      jobId: queued.jobId,
+      status: queued.status,
+      alreadyCompleted: queued.alreadyCompleted ?? false,
+    });
   } catch (e) {
-    console.error('Webhook split error:', e);
+    console.error('Webhook enqueue error:', e);
     try {
       await db.insertActivityLog({
         userId: user.id,
         email: u?.email,
-        action: 'webhook_split_error',
-        message: e?.message || 'Split failed',
+        action: 'webhook_enqueue_error',
+        message: e?.message || 'Failed to queue payment',
         meta: { payment_id: paymentId },
       });
     } catch (_) {}
@@ -1293,9 +1156,10 @@ api.post('/process-payments', requireAuth, async (req, res) => {
       message: 'Set Whop API key and Company ID in Settings',
     });
   }
-  const state = await db.getFullAutoSplit(userId);
-  const processed = new Set(state.processedPaymentIds);
-  const results = { processed: 0, skipped: 0, errors: [] };
+  const splitState = await db.getFullAutoSplit(userId);
+  const transferState = await db.getFullAutoTransfer(userId);
+  const processed = new Set([...splitState.processedPaymentIds, ...transferState.processedPaymentIds]);
+  const results = { queued: 0, skipped: 0, errors: [] };
   try {
     const page = await whop.payments.list({
       company_id: companyId,
@@ -1310,13 +1174,15 @@ api.post('/process-payments', requireAuth, async (req, res) => {
         continue;
       }
       try {
-        const result = await runSplitForPayment(p.id, userId);
-        if (result.ran) results.processed++;
+        const q = await db.enqueuePaymentJob(userId, p.id);
+        if (q.queued) results.queued++;
+        else results.skipped++;
       } catch (e) {
         results.errors.push({ payment_id: p.id, message: e?.message });
       }
     }
-    return res.json(results);
+    wakePaymentWorker();
+    return res.json({ ...results, message: 'Payments queued for background processing.' });
   } catch (err) {
     const message = err?.message || err?.toString?.() || 'Failed to list payments';
     return res.status(500).json({
@@ -1455,14 +1321,36 @@ api.get('/admin/logs', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+api.get('/admin/queue', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const stats = await db.getPaymentJobQueueStats();
+    return res.json({ stats, worker: getWorkerConfig() });
+  } catch (err) {
+    console.error('Admin queue stats error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not load queue stats.' });
+  }
+});
+
 api.get('/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
   const days = Math.min(Number(req.query.days) || 30, 90);
   try {
-    const stats = await db.getAnalyticsStats(days);
+    const stats = await db.getAdminInsights(days);
+    stats.worker = getWorkerConfig();
+    stats.workerStatus = getWorkerStatus();
     return res.json(stats);
   } catch (err) {
     console.error('Admin analytics error:', err);
     return res.status(500).json({ error: 'Server error', message: 'Could not load analytics.' });
+  }
+});
+
+api.get('/admin/health', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const health = await collectSystemHealth();
+    return res.json(health);
+  } catch (err) {
+    console.error('Admin health error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not load system health.' });
   }
 });
 
@@ -1496,11 +1384,21 @@ async function start() {
   try {
     await db.query('SELECT 1');
     console.log('Database connected');
+    try {
+      const purged = await db.purgeActivityLogsOlderThan();
+      if (purged > 0) {
+        console.log(`Activity log: purged ${purged} row(s) older than retention window`);
+      }
+    } catch (e) {
+      console.warn('Activity log retention purge skipped:', e?.message);
+    }
   } catch (e) {
     console.error('Database connection failed:', e?.message);
     console.error('Set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME and run scripts/init-db.sql');
     process.exit(1);
   }
+  startPaymentWorker();
+
   const server = app.listen(PORT, () => {
     console.log(`Whop Admin running at http://localhost:${PORT}`);
     console.log(`  Sign up / Login: http://localhost:${PORT}/login`);
