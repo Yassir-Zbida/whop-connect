@@ -479,11 +479,11 @@ export async function listUsersForPaymentPoll() {
             us.poll_tick_ms, us.poll_parallel
      FROM user_settings us
      INNER JOIN users u ON u.id = us.user_id AND u.active = 1
-     LEFT JOIN auto_split_config asc ON asc.user_id = us.user_id
+     LEFT JOIN auto_split_config ascfg ON ascfg.user_id = us.user_id
      LEFT JOIN auto_transfer_config atc ON atc.user_id = us.user_id
      WHERE us.whop_api_key != '' AND us.whop_company_id != ''
        AND us.poll_enabled = 1
-       AND (COALESCE(asc.enabled, 0) = 1 OR COALESCE(atc.enabled, 0) = 1)`
+       AND (COALESCE(ascfg.enabled, 0) = 1 OR COALESCE(atc.enabled, 0) = 1)`
   );
   return rows.map((r) => {
     const tickMs =
