@@ -289,16 +289,17 @@ export default function Analytics() {
   return (
     <main className="main">
       <div className="topbar">
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span className="topbar-title">Analytics</span>
-          <span className="topbar-sub">· Metrics & queues</span>
+        <div className="topbar-heading">
+          <div className="topbar-heading-row">
+            <span className="topbar-title">Analytics</span>
+            <span className="topbar-sub">· Metrics & queues</span>
+          </div>
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div className="topbar-actions">
           <select
             value={days}
             onChange={(e) => setDays(Number(e.target.value))}
             className="select-native"
-            style={{ minWidth: 140, height: 40 }}
           >
             <option value={7}>Last 7 days</option>
             <option value={30}>Last 30 days</option>

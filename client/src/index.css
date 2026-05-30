@@ -335,20 +335,47 @@ body {
 /* ── Main content ── */
 .main { flex: 1; overflow-y: auto; background: var(--bg); }
 .topbar {
-  height: 52px;
+  min-height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 28px;
+  gap: 16px;
+  padding: 12px 28px;
   margin-top: 18px;
   /* border-bottom: 1px solid var(--border); */
   background: var(--bg);
   position: sticky;
   top: 0;
   z-index: 10;
+  flex-wrap: wrap;
+}
+.topbar-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.topbar-heading-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.topbar .select-native {
+  width: auto;
+  min-width: 140px;
+  flex-shrink: 0;
 }
 .topbar-title { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
-.topbar-sub { font-size: 15px; color: var(--text-2); margin-left: 8px; }
+.topbar-sub { font-size: 13px; color: var(--text-2); margin-left: 0; line-height: 1.4; }
+.topbar-heading-row .topbar-sub { font-size: 14px; margin-left: 4px; }
 
 .content { padding: 24px 28px; width: 100%; }
 .settings-grid {

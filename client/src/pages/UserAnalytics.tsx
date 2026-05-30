@@ -243,20 +243,23 @@ export default function UserAnalytics() {
   return (
     <main className="main">
       <div className="topbar">
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span className="topbar-title">Analytics</span>
-          <span className="topbar-sub">· Your activity, transfers & workflows</span>
+        <div className="topbar-heading">
+          <div className="topbar-heading-row">
+            <span className="topbar-title">Analytics</span>
+            <span className="topbar-sub">· Your activity, transfers & workflows</span>
+          </div>
         </div>
-        <select
-          value={days}
-          onChange={(e) => setDays(Number(e.target.value))}
-          className="select-native"
-          style={{ minWidth: 140, height: 40 }}
-        >
-          <option value={7}>Last 7 days</option>
-          <option value={30}>Last 30 days</option>
-          <option value={90}>Last 90 days</option>
-        </select>
+        <div className="topbar-actions">
+          <select
+            value={days}
+            onChange={(e) => setDays(Number(e.target.value))}
+            className="select-native"
+          >
+            <option value={7}>Last 7 days</option>
+            <option value={30}>Last 30 days</option>
+            <option value={90}>Last 90 days</option>
+          </select>
+        </div>
       </div>
 
       <div className="admin-tabs" style={{ padding: '0 24px', marginTop: 8 }}>
