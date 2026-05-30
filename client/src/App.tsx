@@ -17,6 +17,7 @@ import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import Admin from './pages/Admin';
 import Analytics from './pages/Analytics';
+import UserAnalytics from './pages/UserAnalytics';
 import SystemHealth from './pages/SystemHealth';
 import DashboardLayout from './components/DashboardLayout';
 
@@ -118,7 +119,7 @@ export default function App() {
         }
       >
         <Route index element={<Navigate to={user?.role === 'admin' ? '/analytics' : '/connected-accounts'} replace />} />
-        <Route path="analytics" element={user?.role === 'admin' ? <Analytics /> : <Navigate to="/" replace />} />
+        <Route path="analytics" element={user?.role === 'admin' ? <Analytics /> : <UserAnalytics />} />
         <Route path="system-health" element={user?.role === 'admin' ? <SystemHealth /> : <Navigate to="/" replace />} />
         <Route path="connected-accounts" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <ConnectedAccounts />} />
         <Route path="transactions" element={user?.role === 'admin' ? <Navigate to="/analytics" replace /> : <Transactions />} />

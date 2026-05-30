@@ -51,8 +51,17 @@ import {
   getWorkerStatus,
   startPaymentWorker,
   wakePaymentWorker,
+  processUserPendingJobs,
 } from './lib/payment-worker.js';
+import {
+  getPollerConfig,
+  getPollerStatus,
+  startPaymentPoller,
+  wakePaymentPoller,
+} from './lib/payment-poller.js';
+import { doPollUserPayments } from './lib/poll-user-payments.js';
 import { collectSystemHealth } from './lib/system-health.js';
+import { createAdjustedTransfer, isPermanentTransferError } from './lib/transfer-fees.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -296,6 +305,7 @@ api.post('/register', async (req, res) => {
       isAdminEmailPromotionAllowed() && ADMIN_EMAIL && e === ADMIN_EMAIL ? 'admin' : 'user';
     const hash = await hashPassword(p);
     const userId = await db.createUser(e, hash, role);
+    await db.ensureUserSettings(userId);
     await regenerateSession(req);
     req.session.user = { id: userId, email: e, role };
     await db.insertActivityLog({ userId, email: e, action: 'register', message: 'User signed up' });
@@ -388,6 +398,23 @@ api.get('/settings', requireAuth, async (req, res) => {
   const settings = await db.getUserSettings(userId);
   const webhookToken = settings?.webhook_token || null;
   const webhookSecretSet = Boolean(settings?.whop_webhook_secret);
+  const platformCommissionPct = settings?.platform_commission_pct ?? 1;
+  const cachedFeePct = settings?.cached_fee_pct ?? null;
+  const pollIntervalSeconds = settings?.poll_interval_seconds ?? 60;
+  const pollEnabled = settings?.poll_enabled !== false;
+  const pollTickMs = settings?.poll_tick_ms ?? pollIntervalSeconds * 1000;
+  const pollParallel = settings?.poll_parallel ?? 5;
+  const pollsTotal = settings?.polls_total ?? 0;
+  const lastPollAt = settings?.last_poll_at
+    ? new Date(settings.last_poll_at).toISOString()
+    : null;
+  const lastPollError = settings?.last_poll_error ?? null;
+  const workerEnabled = settings?.worker_enabled !== false;
+  const workerConcurrency = settings?.worker_concurrency ?? 5;
+  let workerQueue = { pending: 0, processing: 0, completed: 0, failed: 0 };
+  try {
+    workerQueue = await db.getUserPaymentJobStats(userId);
+  } catch (_) {}
   const baseUrl = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'production' ? '' : `http://localhost:${PORT}`);
   const webhookUrl = webhookToken && baseUrl ? `${baseUrl}/api/webhooks/whop/${webhookToken}` : null;
   return res.json({
@@ -398,12 +425,37 @@ api.get('/settings', requireAuth, async (req, res) => {
     whopWebhookSecretSet: webhookSecretSet,
     adminPasswordSet: true,
     webhookUrl,
+    platformCommissionPct,
+    cachedFeePct,
+    pollIntervalSeconds,
+    pollEnabled,
+    pollTickMs,
+    pollParallel,
+    pollsTotal,
+    lastPollAt,
+    lastPollError,
+    workerEnabled,
+    workerConcurrency,
+    workerQueue,
   });
 });
 
 api.put('/settings', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const { whopApiKey, whopCompanyId, whopWebhookSecret, currentPassword, newPassword } = req.body || {};
+  const {
+    whopApiKey,
+    whopCompanyId,
+    whopWebhookSecret,
+    platformCommissionPct,
+    pollIntervalSeconds,
+    pollEnabled,
+    pollTickMs,
+    pollParallel,
+    workerEnabled,
+    workerConcurrency,
+    currentPassword,
+    newPassword,
+  } = req.body || {};
 
   if (typeof newPassword === 'string' && newPassword.trim()) {
     if (!currentPassword || typeof currentPassword !== 'string') {
@@ -422,7 +474,25 @@ api.put('/settings', requireAuth, async (req, res) => {
     await db.updateUserPassword(userId, await hashPassword(newPassword.trim()));
   }
 
-  await db.setUserSettings(userId, { whopApiKey, whopCompanyId, whopWebhookSecret });
+  try {
+    await db.setUserSettings(userId, {
+      whopApiKey,
+      whopCompanyId,
+      whopWebhookSecret,
+      platformCommissionPct,
+      pollIntervalSeconds,
+      pollEnabled,
+      pollTickMs,
+      pollParallel,
+      workerEnabled,
+      workerConcurrency,
+    });
+  } catch (err) {
+    const message = err?.message || 'Invalid settings';
+    return res.status(400).json({ error: message });
+  }
+  wakePaymentPoller();
+  wakePaymentWorker();
   const u = await db.getUserById(userId);
   await db.insertActivityLog({
     userId,
@@ -603,33 +673,51 @@ api.post('/transfers', requireAuth, async (req, res) => {
     }
 
     const transferPayload = {
-      amount: numAmount,
+      gross: numAmount,
       currency: (currency || 'usd').toLowerCase(),
-      origin_id: companyId,
-      destination_id: destId,
+      originId: companyId,
+      destinationId: destId,
       ...(metadata && typeof metadata === 'object' && Object.keys(metadata).length ? { metadata } : {}),
       ...(typeof notes === 'string' && notes.trim().length > 0 ? { notes: notes.trim().slice(0, 50) } : {}),
     };
-    const transfer = await whop.transfers.create(transferPayload);
+    const result = await createAdjustedTransfer(whop, userId, transferPayload);
 
     const u = await db.getUserById(userId);
     await db.insertActivityLog({
       userId,
       email: u?.email,
       action: 'transfer_create',
-      message: `Transfer ${transfer.amount} ${transfer.currency} to ${destId}`,
-      meta: { transfer_id: transfer.id },
+      message: `Transfer ${result.adjusted} ${result.transfer.currency} to ${destId} (gross ${result.gross})`,
+      meta: {
+        transfer_id: result.transfer.id,
+        gross: result.gross,
+        platform_commission: result.platformCommission,
+        sendable: result.sendable,
+        adjusted: result.adjusted,
+        fee_pct: result.feePct,
+      },
     });
 
     return res.status(201).json({
-      id: transfer.id,
-      amount: transfer.amount,
-      currency: transfer.currency,
-      destination_id: transfer.destination_id,
+      id: result.transfer.id,
+      amount: result.transfer.amount,
+      currency: result.transfer.currency,
+      destination_id: result.transfer.destination_id,
+      gross: result.gross,
+      platform_commission: result.platformCommission,
+      sendable: result.sendable,
+      adjusted: result.adjusted,
+      fee_pct: result.feePct,
       message: 'Transfer created successfully.',
     });
   } catch (err) {
     const message = err?.message || err?.toString?.() || 'Unknown error';
+    if (isPermanentTransferError(err)) {
+      return res.status(400).json({
+        error: 'Transfer amount too small',
+        message,
+      });
+    }
     const status = err?.statusCode ?? err?.response?.status ?? 500;
     return res.status(typeof status === 'number' ? status : 500).json({
       error: 'Whop API error',
@@ -1010,51 +1098,85 @@ api.delete('/auto-transfer/rules/:id', requireAuth, async (req, res) => {
   return res.json({ ok: true, rules });
 });
 
+// Process pending payment queue for current user (POST /api/process-queue)
+api.post('/process-queue', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  try {
+    const result = await processUserPendingJobs(userId, { manual: true });
+    const u = await db.getUserById(userId);
+    await db.insertActivityLog({
+      userId,
+      email: u?.email,
+      action: 'payment_worker',
+      message: result.message || `Processed ${result.processed} queued payment(s)`,
+      meta: {
+        processed: result.processed,
+        failed: result.failed,
+        pending: result.pending,
+        errors: result.errors?.length ?? 0,
+      },
+    });
+    return res.json(result);
+  } catch (err) {
+    const message = err?.message || err?.toString?.() || 'Process queue failed';
+    return res.status(500).json({ error: 'Process queue error', message });
+  }
+});
+
+// Manual poll — same logic as background poller (POST /api/poll)
+api.post('/poll', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  try {
+    const result = await doPollUserPayments(userId, { manual: true });
+    const u = await db.getUserById(userId);
+    await db.insertActivityLog({
+      userId,
+      email: u?.email,
+      action: 'payment_poll',
+      message: result.firstPoll
+        ? 'First poll: recorded start time'
+        : `Poll queued ${result.queued}, skipped ${result.skipped}`,
+      meta: {
+        queued: result.queued,
+        skipped: result.skipped,
+        firstPoll: result.firstPoll,
+        errors: result.errors?.length ?? 0,
+      },
+    });
+    if (!result.ok && result.reason === 'not_configured') {
+      return res.status(503).json({
+        error: 'Server not configured',
+        message: 'Set Whop API key and Company ID in Settings',
+        ...result,
+      });
+    }
+    return res.json(result);
+  } catch (err) {
+    const message = err?.message || err?.toString?.() || 'Poll failed';
+    return res.status(500).json({ error: 'Poll error', message });
+  }
+});
+
 // Process recent payments for auto-transfer (catch-up)
 api.post('/process-payments-auto-transfer', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const whop = await getWhop(userId);
-  const companyId = await getWhopCompanyId(userId);
-  if (!whop || !companyId) {
-    return res.status(503).json({
-      error: 'Server not configured',
-      message: 'Set Whop API key and Company ID in Settings',
-    });
-  }
-  const splitState = await db.getFullAutoSplit(userId);
-  const transferState = await db.getFullAutoTransfer(userId);
-  const processed = new Set([...splitState.processedPaymentIds, ...transferState.processedPaymentIds]);
-  const results = { queued: 0, skipped: 0, errors: [] };
   try {
-    const page = await whop.payments.list({
-      company_id: companyId,
-      first: 100,
-      order: 'paid_at',
-      direction: 'desc',
-    });
-    const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
-    for (const p of items) {
-      if (p.status !== 'paid' || processed.has(p.id)) {
-        results.skipped++;
-        continue;
-      }
-      try {
-        const q = await db.enqueuePaymentJob(userId, p.id);
-        if (q.queued) results.queued++;
-        else results.skipped++;
-      } catch (e) {
-        results.errors.push({ payment_id: p.id, message: e?.message });
-      }
+    const result = await doPollUserPayments(userId, { fullScan: true, manual: true });
+    if (result.reason === 'not_configured') {
+      return res.status(503).json({
+        error: 'Server not configured',
+        message: 'Set Whop API key and Company ID in Settings',
+      });
     }
-    wakePaymentWorker();
-    return res.json({ ...results, message: 'Payments queued for background processing.' });
+    return res.json({
+      queued: result.queued,
+      skipped: result.skipped,
+      errors: result.errors,
+      message: result.message || 'Payments queued for background processing.',
+    });
   } catch (err) {
     const message = err?.message || err?.toString?.() || 'Failed to list payments';
-    return res.status(500).json({
-      error: 'Whop API error',
-      message,
-      ...results,
-    });
+    return res.status(500).json({ error: 'Whop API error', message });
   }
 });
 
@@ -1148,48 +1270,23 @@ api.post('/webhooks/whop/:token', async (req, res) => {
 // Process recent payments (catch-up)
 api.post('/process-payments', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const whop = await getWhop(userId);
-  const companyId = await getWhopCompanyId(userId);
-  if (!whop || !companyId) {
-    return res.status(503).json({
-      error: 'Server not configured',
-      message: 'Set Whop API key and Company ID in Settings',
-    });
-  }
-  const splitState = await db.getFullAutoSplit(userId);
-  const transferState = await db.getFullAutoTransfer(userId);
-  const processed = new Set([...splitState.processedPaymentIds, ...transferState.processedPaymentIds]);
-  const results = { queued: 0, skipped: 0, errors: [] };
   try {
-    const page = await whop.payments.list({
-      company_id: companyId,
-      first: 100,
-      order: 'paid_at',
-      direction: 'desc',
-    });
-    const items = page.getPaginatedItems ? page.getPaginatedItems() : [];
-    for (const p of items) {
-      if (p.status !== 'paid' || processed.has(p.id)) {
-        results.skipped++;
-        continue;
-      }
-      try {
-        const q = await db.enqueuePaymentJob(userId, p.id);
-        if (q.queued) results.queued++;
-        else results.skipped++;
-      } catch (e) {
-        results.errors.push({ payment_id: p.id, message: e?.message });
-      }
+    const result = await doPollUserPayments(userId, { fullScan: true, manual: true });
+    if (result.reason === 'not_configured') {
+      return res.status(503).json({
+        error: 'Server not configured',
+        message: 'Set Whop API key and Company ID in Settings',
+      });
     }
-    wakePaymentWorker();
-    return res.json({ ...results, message: 'Payments queued for background processing.' });
+    return res.json({
+      queued: result.queued,
+      skipped: result.skipped,
+      errors: result.errors,
+      message: result.message || 'Payments queued for background processing.',
+    });
   } catch (err) {
     const message = err?.message || err?.toString?.() || 'Failed to list payments';
-    return res.status(500).json({
-      error: 'Whop API error',
-      message,
-      ...results,
-    });
+    return res.status(500).json({ error: 'Whop API error', message });
   }
 });
 
@@ -1331,6 +1428,18 @@ api.get('/admin/queue', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+api.get('/analytics', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const days = Math.min(Number(req.query.days) || 30, 90);
+  try {
+    const stats = await db.getUserInsights(userId, days);
+    return res.json(stats);
+  } catch (err) {
+    console.error('User analytics error:', err);
+    return res.status(500).json({ error: 'Server error', message: 'Could not load analytics.' });
+  }
+});
+
 api.get('/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
   const days = Math.min(Number(req.query.days) || 30, 90);
   try {
@@ -1398,6 +1507,7 @@ async function start() {
     process.exit(1);
   }
   startPaymentWorker();
+  startPaymentPoller();
 
   const server = app.listen(PORT, () => {
     console.log(`Whop Admin running at http://localhost:${PORT}`);

@@ -74,9 +74,20 @@ export default function SimpleTransfer() {
       ...(notes.trim() ? { notes: notes.trim().slice(0, 50) } : {}),
     })
       .then((res) => {
-        const text = `Transfer created. ID: ${res.id}`;
+        const parts = [`Transfer created. ID: ${res.id}`];
+        if (res.adjusted != null && res.gross != null && res.adjusted !== res.gross) {
+          parts.push(
+            `Sent $${res.adjusted.toFixed(2)} (from $${res.gross.toFixed(2)} after commission and Whop fees).`
+          );
+        }
+        const text = parts.join(' ');
         setMsg({ text, error: false });
-        logSuccess('Simple transfer', text, { transferId: res.id, amount: num, destination_id: destId });
+        logSuccess('Simple transfer', text, {
+          transferId: res.id,
+          amount: num,
+          adjusted: res.adjusted,
+          destination_id: destId,
+        });
         showToast(text);
         setAmount('');
         setNotes('');
@@ -121,6 +132,7 @@ export default function SimpleTransfer() {
             <p className="card-desc">
               Send funds from your company to any Whop account: user (<code>user_xxx</code>), company (
               <code>biz_xxx</code>), or ledger account (<code>ldgr_xxx</code>). No need for a connected account.
+              Amount is debited from your balance; platform commission and Whop transfer fees are deducted automatically.
             </p>
             {!companyId ? (
               <div className="alert alert-error" style={{ marginTop: 12 }}>

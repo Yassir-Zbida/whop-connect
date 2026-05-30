@@ -237,24 +237,101 @@ function encryptSetting(value) {
 
 function normalizeSettingsRow(row) {
   if (!row) return null;
+  const commissionRaw = row.platform_commission_pct;
+  const commission =
+    commissionRaw != null && Number.isFinite(Number(commissionRaw)) ? Number(commissionRaw) : 1;
+  const cachedFeeRaw = row.cached_fee_pct;
+  const cachedFeePct =
+    cachedFeeRaw != null && Number.isFinite(Number(cachedFeeRaw)) ? Number(cachedFeeRaw) : null;
+  const pollIntervalRaw = row.poll_interval_seconds;
+  const pollIntervalSeconds =
+    pollIntervalRaw != null && Number.isFinite(Number(pollIntervalRaw)) ? Number(pollIntervalRaw) : 60;
+  const pollTickRaw = row.poll_tick_ms;
+  const pollTickMs =
+    pollTickRaw != null && Number.isFinite(Number(pollTickRaw))
+      ? Number(pollTickRaw)
+      : pollIntervalSeconds * 1000;
+  const pollParallelRaw = row.poll_parallel;
+  const pollParallel =
+    pollParallelRaw != null && Number.isFinite(Number(pollParallelRaw)) ? Number(pollParallelRaw) : 5;
+  const pollEnabled = row.poll_enabled == null ? true : Boolean(Number(row.poll_enabled));
+  const workerConcurrencyRaw = row.worker_concurrency;
+  const workerConcurrency =
+    workerConcurrencyRaw != null && Number.isFinite(Number(workerConcurrencyRaw))
+      ? Number(workerConcurrencyRaw)
+      : 5;
+  const workerEnabled = row.worker_enabled == null ? true : Boolean(Number(row.worker_enabled));
+  const pollsTotal =
+    row.polls_total != null && Number.isFinite(Number(row.polls_total)) ? Number(row.polls_total) : 0;
   return {
     whop_api_key: decryptSetting(row.whop_api_key),
     whop_company_id: row.whop_company_id || '',
     whop_webhook_secret: decryptSetting(row.whop_webhook_secret),
     webhook_token: row.webhook_token || '',
+    platform_commission_pct: commission,
+    cached_fee_pct: cachedFeePct,
+    last_poll_at: row.last_poll_at ?? null,
+    poll_interval_seconds: pollIntervalSeconds,
+    poll_enabled: pollEnabled,
+    poll_tick_ms: pollTickMs,
+    poll_parallel: pollParallel,
+    polls_total: pollsTotal,
+    last_poll_error: row.last_poll_error || null,
+    worker_enabled: workerEnabled,
+    worker_concurrency: workerConcurrency,
   };
 }
 
 // ——— User settings (Whop API key, company ID, webhook token, webhook secret) ———
+
+/** Create default settings row if missing (worker + poller on by default). */
+export async function ensureUserSettings(userId) {
+  const uid = Number(userId);
+  if (!uid) return;
+  const webhookToken = crypto.randomBytes(24).toString('hex');
+  await getPool().execute(
+    `INSERT INTO user_settings (user_id, webhook_token, poll_enabled, worker_enabled)
+     VALUES (?, ?, 1, 1)
+     ON DUPLICATE KEY UPDATE user_id = user_id`,
+    [uid, webhookToken]
+  );
+}
+
 export async function getUserSettings(userId) {
+  await ensureUserSettings(userId);
   const rows = await query(
-    'SELECT whop_api_key, whop_company_id, whop_webhook_secret, webhook_token FROM user_settings WHERE user_id = ? LIMIT 1',
+    `SELECT whop_api_key, whop_company_id, whop_webhook_secret, webhook_token,
+            platform_commission_pct, cached_fee_pct,
+            last_poll_at, poll_interval_seconds, poll_enabled, poll_tick_ms, poll_parallel,
+            polls_total, last_poll_error, worker_enabled, worker_concurrency
+     FROM user_settings WHERE user_id = ? LIMIT 1`,
     [userId]
   );
   return normalizeSettingsRow(rows[0]) || null;
 }
 
-export async function setUserSettings(userId, { whopApiKey, whopCompanyId, whopWebhookSecret }) {
+export async function updateCachedFeePct(userId, feePct) {
+  const pct = Number(feePct);
+  if (!Number.isFinite(pct) || pct < 0 || pct >= 1) return false;
+  const [result] = await getPool().execute(
+    'UPDATE user_settings SET cached_fee_pct = ? WHERE user_id = ?',
+    [pct, userId]
+  );
+  return result.affectedRows > 0;
+}
+
+export async function setUserSettings(userId, {
+  whopApiKey,
+  whopCompanyId,
+  whopWebhookSecret,
+  platformCommissionPct,
+  pollIntervalSeconds,
+  pollEnabled,
+  pollTickMs,
+  pollParallel,
+  workerEnabled,
+  workerConcurrency,
+}) {
   const p = getPool();
   const row = await getUserSettings(userId);
   const rawRows = await query(
@@ -276,6 +353,67 @@ export async function setUserSettings(userId, { whopApiKey, whopCompanyId, whopW
       ? String(whopWebhookSecret).trim()
       : (row?.whop_webhook_secret ?? '');
 
+  let commissionPct =
+    row?.platform_commission_pct != null ? Number(row.platform_commission_pct) : 1;
+  if (platformCommissionPct !== undefined) {
+    const next = Number(platformCommissionPct);
+    if (!Number.isFinite(next) || next < 0 || next > 100) {
+      throw new Error('platform_commission_pct must be between 0 and 100');
+    }
+    commissionPct = next;
+  }
+
+  let pollInterval =
+    row?.poll_interval_seconds != null ? Number(row.poll_interval_seconds) : 60;
+  if (pollIntervalSeconds !== undefined) {
+    const next = Math.floor(Number(pollIntervalSeconds));
+    if (!Number.isFinite(next) || next < 10 || next > 86400) {
+      throw new Error('poll_interval_seconds must be between 10 and 86400');
+    }
+    pollInterval = next;
+  }
+
+  let pollTick =
+    row?.poll_tick_ms != null ? Number(row.poll_tick_ms) : pollInterval * 1000;
+  if (pollTickMs !== undefined) {
+    const next = Math.floor(Number(pollTickMs));
+    if (!Number.isFinite(next) || next < 1000 || next > 86400000) {
+      throw new Error('poll_tick_ms must be between 1000 and 86400000');
+    }
+    pollTick = next;
+    pollInterval = Math.max(10, Math.ceil(next / 1000));
+  } else if (pollIntervalSeconds !== undefined) {
+    pollTick = pollInterval * 1000;
+  }
+
+  let pollEnabledVal = row?.poll_enabled == null ? true : Boolean(Number(row.poll_enabled));
+  if (pollEnabled !== undefined) {
+    pollEnabledVal = Boolean(pollEnabled);
+  }
+
+  let pollParallelVal = row?.poll_parallel != null ? Number(row.poll_parallel) : 5;
+  if (pollParallel !== undefined) {
+    const next = Math.floor(Number(pollParallel));
+    if (!Number.isFinite(next) || next < 1 || next > 50) {
+      throw new Error('poll_parallel must be between 1 and 50');
+    }
+    pollParallelVal = next;
+  }
+
+  let workerEnabledVal = row?.worker_enabled == null ? true : Boolean(Number(row.worker_enabled));
+  if (workerEnabled !== undefined) {
+    workerEnabledVal = Boolean(workerEnabled);
+  }
+
+  let workerConcurrencyVal = row?.worker_concurrency != null ? Number(row.worker_concurrency) : 5;
+  if (workerConcurrency !== undefined) {
+    const next = Math.floor(Number(workerConcurrency));
+    if (!Number.isFinite(next) || next < 1 || next > 50) {
+      throw new Error('worker_concurrency must be between 1 and 50');
+    }
+    workerConcurrencyVal = next;
+  }
+
   let apiKeyStored = raw?.whop_api_key ?? '';
   if (whopApiKey !== undefined) {
     apiKeyStored = apiKeyPlain ? encryptSetting(apiKeyPlain) : '';
@@ -286,21 +424,100 @@ export async function setUserSettings(userId, { whopApiKey, whopCompanyId, whopW
   }
 
   await p.execute(
-    `INSERT INTO user_settings (user_id, whop_api_key, whop_company_id, whop_webhook_secret, webhook_token)
-     VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO user_settings (
+       user_id, whop_api_key, whop_company_id, whop_webhook_secret, webhook_token,
+       platform_commission_pct, poll_interval_seconds, poll_enabled, poll_tick_ms, poll_parallel,
+       worker_enabled, worker_concurrency
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        whop_api_key = VALUES(whop_api_key),
        whop_company_id = VALUES(whop_company_id),
        whop_webhook_secret = IF(VALUES(whop_webhook_secret) != '', VALUES(whop_webhook_secret), whop_webhook_secret),
-       webhook_token = IF(COALESCE(webhook_token, '') = '', VALUES(webhook_token), webhook_token)`,
-    [userId, apiKeyStored, companyId, webhookSecretStored, webhookToken]
+       webhook_token = IF(COALESCE(webhook_token, '') = '', VALUES(webhook_token), webhook_token),
+       platform_commission_pct = VALUES(platform_commission_pct),
+       poll_interval_seconds = VALUES(poll_interval_seconds),
+       poll_enabled = VALUES(poll_enabled),
+       poll_tick_ms = VALUES(poll_tick_ms),
+       poll_parallel = VALUES(poll_parallel),
+       worker_enabled = VALUES(worker_enabled),
+       worker_concurrency = VALUES(worker_concurrency)`,
+    [
+      userId,
+      apiKeyStored,
+      companyId,
+      webhookSecretStored,
+      webhookToken,
+      commissionPct,
+      pollInterval,
+      pollEnabledVal ? 1 : 0,
+      pollTick,
+      pollParallelVal,
+      workerEnabledVal ? 1 : 0,
+      workerConcurrencyVal,
+    ]
   );
   return {
     whopApiKey: apiKeyPlain,
     whopCompanyId: companyId,
     whopWebhookSecret: webhookSecretPlain,
     webhookToken,
+    platformCommissionPct: commissionPct,
+    pollIntervalSeconds: pollInterval,
+    pollEnabled: pollEnabledVal,
+    pollTickMs: pollTick,
+    pollParallel: pollParallelVal,
+    workerEnabled: workerEnabledVal,
+    workerConcurrency: workerConcurrencyVal,
   };
+}
+
+/** Users with Whop configured and auto-split or auto-transfer enabled. */
+export async function listUsersForPaymentPoll() {
+  const rows = await query(
+    `SELECT us.user_id AS id, us.last_poll_at, us.poll_interval_seconds,
+            us.poll_tick_ms, us.poll_parallel
+     FROM user_settings us
+     INNER JOIN users u ON u.id = us.user_id AND u.active = 1
+     LEFT JOIN auto_split_config asc ON asc.user_id = us.user_id
+     LEFT JOIN auto_transfer_config atc ON atc.user_id = us.user_id
+     WHERE us.whop_api_key != '' AND us.whop_company_id != ''
+       AND us.poll_enabled = 1
+       AND (COALESCE(asc.enabled, 0) = 1 OR COALESCE(atc.enabled, 0) = 1)`
+  );
+  return rows.map((r) => {
+    const tickMs =
+      r.poll_tick_ms != null && Number(r.poll_tick_ms) > 0
+        ? Number(r.poll_tick_ms)
+        : Math.max(10000, (Number(r.poll_interval_seconds) || 60) * 1000);
+    return {
+      id: r.id,
+      lastPollAt: r.last_poll_at,
+      pollIntervalSeconds: Math.max(10, Number(r.poll_interval_seconds) || 60),
+      pollTickMs: tickMs,
+      pollParallel: Math.max(1, Math.min(50, Number(r.poll_parallel) || 5)),
+    };
+  });
+}
+
+/** Record poll cycle completion (or first-poll timestamp only). */
+export async function recordPollCycle(userId, { error = null, firstPoll = false } = {}) {
+  const errorStr = error ? String(error).slice(0, 512) : null;
+  if (firstPoll) {
+    await getPool().execute(
+      'UPDATE user_settings SET last_poll_at = NOW(), last_poll_error = NULL WHERE user_id = ?',
+      [userId]
+    );
+    return;
+  }
+  await getPool().execute(
+    `UPDATE user_settings SET
+       last_poll_at = NOW(),
+       polls_total = polls_total + 1,
+       last_poll_error = ?
+     WHERE user_id = ?`,
+    [errorStr, userId]
+  );
 }
 
 export async function getUserByWebhookToken(token) {
@@ -685,9 +902,17 @@ export async function claimPendingPaymentJobs(batchSize = 20) {
   try {
     await connection.beginTransaction();
     const [candidates] = await connection.execute(
-      `SELECT id FROM payment_jobs
-       WHERE status = 'pending'
-       ORDER BY created_at ASC
+      `SELECT pj.id
+       FROM payment_jobs pj
+       LEFT JOIN user_settings us ON us.user_id = pj.user_id
+       WHERE pj.status = 'pending'
+         AND COALESCE(us.worker_enabled, 1) = 1
+         AND (
+           SELECT COUNT(*)
+           FROM payment_jobs pj2
+           WHERE pj2.user_id = pj.user_id AND pj2.status = 'processing'
+         ) < COALESCE(us.worker_concurrency, 5)
+       ORDER BY pj.created_at ASC
        LIMIT ${limit}
        FOR UPDATE SKIP LOCKED`
     );
@@ -759,6 +984,69 @@ export async function getPaymentJobQueueStats() {
     stats[r.status] = Number(r.count) || 0;
   }
   return stats;
+}
+
+/** Pending/processing/failed counts for one user's payment queue. */
+export async function getUserPaymentJobStats(userId) {
+  const rows = await query(
+    `SELECT status, COUNT(*) AS count
+     FROM payment_jobs
+     WHERE user_id = ?
+     GROUP BY status`,
+    [userId]
+  );
+  const stats = { pending: 0, processing: 0, completed: 0, failed: 0 };
+  for (const r of rows) {
+    stats[r.status] = Number(r.count) || 0;
+  }
+  return stats;
+}
+
+/** Claim pending jobs for one user (manual "process queue now"). */
+export async function claimPendingPaymentJobsForUser(userId, batchSize = 25) {
+  const limit = Math.min(Math.max(1, Number(batchSize) || 25), 100);
+  const lockSec = Number(process.env.PAYMENT_JOB_LOCK_SECONDS) || 180;
+  const uid = Number(userId);
+
+  const connection = await getPool().getConnection();
+  try {
+    await connection.beginTransaction();
+    const [candidates] = await connection.execute(
+      `SELECT id FROM payment_jobs
+       WHERE user_id = ? AND status = 'pending'
+       ORDER BY created_at ASC
+       LIMIT ${limit}
+       FOR UPDATE SKIP LOCKED`,
+      [uid]
+    );
+    if (!candidates.length) {
+      await connection.commit();
+      return [];
+    }
+    const ids = candidates.map((r) => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    await connection.execute(
+      `UPDATE payment_jobs
+       SET status = 'processing',
+           attempts = attempts + 1,
+           locked_until = DATE_ADD(NOW(), INTERVAL ? SECOND),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders}) AND status = 'pending'`,
+      [lockSec, ...ids]
+    );
+    const [claimed] = await connection.execute(
+      `SELECT id, user_id, payment_id, attempts, max_attempts
+       FROM payment_jobs WHERE id IN (${placeholders}) AND status = 'processing'`,
+      ids
+    );
+    await connection.commit();
+    return claimed;
+  } catch (e) {
+    await connection.rollback();
+    throw e;
+  } finally {
+    connection.release();
+  }
 }
 
 export async function getPaymentJobsByUser() {
@@ -982,6 +1270,261 @@ export async function getWorkflowEventsByDay(days = 30) {
     if (r.action === 'webhook_auto_transfer') entry.transfer = Number(r.count) || 0;
   }
   return Array.from(byDate.values());
+}
+
+export async function getUserPaymentJobStats(userId) {
+  const rows = await query(
+    `SELECT status, COUNT(*) AS count FROM payment_jobs WHERE user_id = ? GROUP BY status`,
+    [userId]
+  );
+  const stats = { pending: 0, processing: 0, completed: 0, failed: 0 };
+  for (const r of rows) {
+    stats[r.status] = Number(r.count) || 0;
+  }
+  return stats;
+}
+
+export async function getUserPaymentJobsByDay(userId, days = 30) {
+  const rows = await query(
+    `SELECT DATE(created_at) AS date, status, COUNT(*) AS count
+     FROM payment_jobs
+     WHERE user_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY DATE(created_at), status
+     ORDER BY date ASC`,
+    [userId, days]
+  );
+  const byDate = new Map();
+  for (const r of rows) {
+    const d = String(r.date).slice(0, 10);
+    if (!byDate.has(d)) {
+      byDate.set(d, { date: d, pending: 0, processing: 0, completed: 0, failed: 0 });
+    }
+    byDate.get(d)[r.status] = Number(r.count) || 0;
+  }
+  return Array.from(byDate.values());
+}
+
+export async function getUserActivityByAction(userId, days = 30) {
+  return query(
+    `SELECT action, COUNT(*) AS count FROM activity_log
+     WHERE user_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY action ORDER BY count DESC`,
+    [userId, days]
+  );
+}
+
+export async function getUserTransferCreatesByDay(userId, days = 30) {
+  return query(
+    `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM activity_log
+     WHERE user_id = ? AND action = 'transfer_create'
+       AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY DATE(created_at) ORDER BY date ASC`,
+    [userId, days]
+  );
+}
+
+export async function getUserWorkflowMetrics(userId, days = 30) {
+  const rows = await query(
+    `SELECT action, meta FROM activity_log
+     WHERE user_id = ?
+       AND action IN ('webhook_split', 'webhook_auto_transfer', 'webhook_enqueue', 'payment_poll')
+       AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
+    [userId, days]
+  );
+
+  const global = {
+    splitEvents: 0,
+    splitRan: 0,
+    splitSkipped: 0,
+    transferEvents: 0,
+    transferSuccess: 0,
+    transferWithErrors: 0,
+    enqueueEvents: 0,
+    pollEvents: 0,
+  };
+
+  for (const r of rows) {
+    const meta = parseMeta(r.meta);
+    if (r.action === 'webhook_split') {
+      global.splitEvents++;
+      if (meta.ran === true) global.splitRan++;
+      else global.splitSkipped++;
+    } else if (r.action === 'webhook_auto_transfer') {
+      global.transferEvents++;
+      const transfers = Number(meta.transfers) || 0;
+      const errors = Number(meta.errors) || 0;
+      if (transfers > 0) global.transferSuccess++;
+      if (errors > 0) global.transferWithErrors++;
+    } else if (r.action === 'webhook_enqueue') {
+      global.enqueueEvents++;
+    } else if (r.action === 'payment_poll') {
+      global.pollEvents++;
+    }
+  }
+
+  const splitRunRate =
+    global.splitEvents > 0 ? Math.round((global.splitRan / global.splitEvents) * 1000) / 10 : null;
+  const transferSuccessRate =
+    global.transferEvents > 0
+      ? Math.round((global.transferSuccess / global.transferEvents) * 1000) / 10
+      : null;
+
+  return {
+    global: { ...global, splitRunRate, transferSuccessRate },
+  };
+}
+
+export async function getUserWorkflowEventsByDay(userId, days = 30) {
+  const rows = await query(
+    `SELECT DATE(created_at) AS date, action, COUNT(*) AS count
+     FROM activity_log
+     WHERE user_id = ?
+       AND action IN ('webhook_split', 'webhook_auto_transfer')
+       AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY DATE(created_at), action
+     ORDER BY date ASC`,
+    [userId, days]
+  );
+  const byDate = new Map();
+  for (const r of rows) {
+    const d = String(r.date).slice(0, 10);
+    if (!byDate.has(d)) {
+      byDate.set(d, { date: d, split: 0, transfer: 0 });
+    }
+    const entry = byDate.get(d);
+    if (r.action === 'webhook_split') entry.split = Number(r.count) || 0;
+    if (r.action === 'webhook_auto_transfer') entry.transfer = Number(r.count) || 0;
+  }
+  return Array.from(byDate.values());
+}
+
+export async function getUserAppStats(userId, days = 30) {
+  let connectedAccountsTotal = 0;
+  let autoSplitRulesTotal = 0;
+  let autoTransferRulesTotal = 0;
+  let transferCreatesInPeriod = 0;
+  let autoSplitEnabled = false;
+  let autoTransferEnabled = false;
+  let processedSplitPayments = 0;
+  let processedTransferPayments = 0;
+
+  try {
+    const [ca] = await query('SELECT COUNT(*) AS total FROM connected_accounts WHERE user_id = ?', [
+      userId,
+    ]);
+    connectedAccountsTotal = ca?.total ?? 0;
+  } catch (_) {}
+
+  try {
+    const [asr] = await query('SELECT COUNT(*) AS total FROM auto_split_rules WHERE user_id = ?', [
+      userId,
+    ]);
+    autoSplitRulesTotal = asr?.total ?? 0;
+  } catch (_) {}
+
+  try {
+    const [atr] = await query('SELECT COUNT(*) AS total FROM auto_transfer_rules WHERE user_id = ?', [
+      userId,
+    ]);
+    autoTransferRulesTotal = atr?.total ?? 0;
+  } catch (_) {}
+
+  try {
+    const [tc] = await query(
+      `SELECT COUNT(*) AS total FROM activity_log
+       WHERE user_id = ? AND action = 'transfer_create'
+         AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
+      [userId, days]
+    );
+    transferCreatesInPeriod = tc?.total ?? 0;
+  } catch (_) {}
+
+  try {
+    const splitState = await getFullAutoSplit(userId);
+    autoSplitEnabled = Boolean(splitState.enabled);
+    processedSplitPayments = splitState.processedPaymentIds?.length ?? 0;
+  } catch (_) {}
+
+  try {
+    const transferState = await getFullAutoTransfer(userId);
+    autoTransferEnabled = Boolean(transferState.enabled);
+    processedTransferPayments = transferState.processedPaymentIds?.length ?? 0;
+  } catch (_) {}
+
+  return {
+    connectedAccountsTotal,
+    autoSplitRulesTotal,
+    autoTransferRulesTotal,
+    transferCreatesInPeriod,
+    autoSplitEnabled,
+    autoTransferEnabled,
+    processedSplitPayments,
+    processedTransferPayments,
+  };
+}
+
+export async function getUserInsights(userId, days = 30) {
+  const d = Math.max(1, Math.min(Number(days) || 30, 90));
+
+  const activityByAction = (await getUserActivityByAction(userId, d)).map((r) => ({
+    action: r.action,
+    count: Number(r.count) || 0,
+  }));
+
+  const transferCreatesByDay = (await getUserTransferCreatesByDay(userId, d)).map((r) => ({
+    date: String(r.date).slice(0, 10),
+    count: Number(r.count) || 0,
+  }));
+
+  const appStats = await getUserAppStats(userId, d);
+
+  let queue = {
+    global: { pending: 0, processing: 0, completed: 0, failed: 0 },
+    byDay: [],
+    failedLast24h: 0,
+    tableAvailable: true,
+  };
+  try {
+    queue.global = await getUserPaymentJobStats(userId);
+    queue.byDay = await getUserPaymentJobsByDay(userId, d);
+    const [failRow] = await query(
+      `SELECT COUNT(*) AS count FROM payment_jobs
+       WHERE user_id = ? AND status = 'failed'
+         AND updated_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)`,
+      [userId]
+    );
+    queue.failedLast24h = Number(failRow?.count) || 0;
+  } catch (e) {
+    queue.tableAvailable = false;
+    queue.error = e?.message || 'payment_jobs unavailable';
+  }
+
+  const finished = (queue.global.completed || 0) + (queue.global.failed || 0);
+  const jobCompletionRate =
+    finished > 0 ? Math.round(((queue.global.completed || 0) / finished) * 1000) / 10 : null;
+
+  let workflows = { global: {}, byDay: [] };
+  try {
+    workflows = await getUserWorkflowMetrics(userId, d);
+    workflows.byDay = await getUserWorkflowEventsByDay(userId, d);
+  } catch (_) {}
+
+  const recentActivity = await getActivityLogs(40, 0, { userId });
+  const settings = await getUserSettings(userId);
+
+  return {
+    days: d,
+    activityByAction,
+    transferCreatesByDay,
+    appStats,
+    queue: { ...queue, jobCompletionRate },
+    workflows,
+    recentActivity,
+    pollsTotal: settings?.polls_total ?? 0,
+    pollEnabled: settings?.poll_enabled !== false,
+    workerEnabled: settings?.worker_enabled !== false,
+    workerConcurrency: settings?.worker_concurrency ?? 5,
+  };
 }
 
 /** Extended admin analytics: base stats + queue + workflow metrics. */

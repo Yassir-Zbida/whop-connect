@@ -54,6 +54,12 @@ export default function DashboardLayout({ user, onLogout }: Props) {
             </>
           ) : (
             <>
+              <NavLink to="/analytics" className={navClass}>
+                <span className="nav-icon">
+                  <Icon d={IconPaths.chart} size={14} />
+                </span>
+                Analytics
+              </NavLink>
               <NavLink to="/connected-accounts" className={navClass}>
                 <span className="nav-icon">
                   <Icon d={IconPaths.link} size={14} />

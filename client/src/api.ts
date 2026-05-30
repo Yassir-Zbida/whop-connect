@@ -215,8 +215,19 @@ export async function createTransfer(body: {
   destination_id: string;
   metadata?: { order_id?: string };
   notes?: string;
-}): Promise<{ id: string }> {
-  return request<{ id: string }>('/api/transfers', { method: 'POST', body: JSON.stringify(body) });
+}): Promise<{
+  id: string;
+  amount?: number;
+  currency?: string;
+  destination_id?: string;
+  gross?: number;
+  platform_commission?: number;
+  sendable?: number;
+  adjusted?: number;
+  fee_pct?: number;
+  message?: string;
+}> {
+  return request('/api/transfers', { method: 'POST', body: JSON.stringify(body) });
 }
 
 // ——— Auto-split workflow ———
@@ -351,16 +362,62 @@ export type Settings = {
   whopWebhookSecretSet?: boolean;
   adminPasswordSet: boolean;
   webhookUrl?: string | null;
+  platformCommissionPct?: number;
+  cachedFeePct?: number | null;
+  pollIntervalSeconds?: number;
+  pollEnabled?: boolean;
+  pollTickMs?: number;
+  pollParallel?: number;
+  pollsTotal?: number;
+  lastPollAt?: string | null;
+  lastPollError?: string | null;
+  workerEnabled?: boolean;
+  workerConcurrency?: number;
+  workerQueue?: { pending: number; processing: number; completed: number; failed: number };
 };
 
 export async function getSettings(): Promise<Settings> {
   return request<Settings>('/api/settings');
 }
 
+export async function pollPaymentsNow(): Promise<{
+  ok: boolean;
+  reason?: string;
+  queued: number;
+  skipped: number;
+  errors: Array<{ payment_id: string | null; message: string }>;
+  firstPoll?: boolean;
+  message?: string;
+  lastPollAt?: string | null;
+  pollsTotal?: number;
+}> {
+  return request('/api/poll', { method: 'POST' });
+}
+
+export async function processPaymentQueueNow(): Promise<{
+  ok: boolean;
+  reason?: string;
+  processed: number;
+  failed: number;
+  pending: number;
+  processing?: number;
+  errors: Array<{ jobId?: number; message: string }>;
+  message?: string;
+}> {
+  return request('/api/process-queue', { method: 'POST' });
+}
+
 export async function updateSettings(body: {
   whopApiKey?: string;
   whopCompanyId?: string;
   whopWebhookSecret?: string;
+  platformCommissionPct?: number;
+  pollIntervalSeconds?: number;
+  pollEnabled?: boolean;
+  pollTickMs?: number;
+  pollParallel?: number;
+  workerEnabled?: boolean;
+  workerConcurrency?: number;
   currentPassword?: string;
   newPassword?: string;
 }): Promise<{ ok: boolean; message?: string }> {
@@ -507,6 +564,61 @@ export type SystemHealth = {
 export async function getAdminAnalytics(days?: number): Promise<AdminAnalytics> {
   const params = days != null ? `?days=${days}` : '';
   return request<AdminAnalytics>(`/api/admin/analytics${params}`);
+}
+
+export type UserAnalytics = {
+  days: number;
+  activityByAction: Array<{ action: string; count: number }>;
+  transferCreatesByDay: Array<{ date: string; count: number }>;
+  appStats: {
+    connectedAccountsTotal: number;
+    autoSplitRulesTotal: number;
+    autoTransferRulesTotal: number;
+    transferCreatesInPeriod: number;
+    autoSplitEnabled: boolean;
+    autoTransferEnabled: boolean;
+    processedSplitPayments: number;
+    processedTransferPayments: number;
+  };
+  queue: {
+    global: { pending: number; processing: number; completed: number; failed: number };
+    byDay: Array<{ date: string; pending: number; processing: number; completed: number; failed: number }>;
+    failedLast24h: number;
+    jobCompletionRate: number | null;
+    tableAvailable?: boolean;
+    error?: string;
+  };
+  workflows: {
+    global: {
+      splitEvents: number;
+      splitRan: number;
+      splitSkipped: number;
+      transferEvents: number;
+      transferSuccess: number;
+      transferWithErrors: number;
+      enqueueEvents: number;
+      pollEvents: number;
+      splitRunRate: number | null;
+      transferSuccessRate: number | null;
+    };
+    byDay: Array<{ date: string; split: number; transfer: number }>;
+  };
+  recentActivity: Array<{
+    id: number;
+    user_id: number | null;
+    email: string | null;
+    action: string;
+    message: string;
+    meta: Record<string, unknown> | null;
+    created_at: string;
+  }>;
+  pollsTotal: number;
+  pollEnabled: boolean;
+};
+
+export async function getUserAnalytics(days?: number): Promise<UserAnalytics> {
+  const params = days != null ? `?days=${days}` : '';
+  return request<UserAnalytics>(`/api/analytics${params}`);
 }
 
 export async function getAdminHealth(): Promise<SystemHealth> {
