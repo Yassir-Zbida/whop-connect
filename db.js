@@ -1272,18 +1272,6 @@ export async function getWorkflowEventsByDay(days = 30) {
   return Array.from(byDate.values());
 }
 
-export async function getUserPaymentJobStats(userId) {
-  const rows = await query(
-    `SELECT status, COUNT(*) AS count FROM payment_jobs WHERE user_id = ? GROUP BY status`,
-    [userId]
-  );
-  const stats = { pending: 0, processing: 0, completed: 0, failed: 0 };
-  for (const r of rows) {
-    stats[r.status] = Number(r.count) || 0;
-  }
-  return stats;
-}
-
 export async function getUserPaymentJobsByDay(userId, days = 30) {
   const rows = await query(
     `SELECT DATE(created_at) AS date, status, COUNT(*) AS count
