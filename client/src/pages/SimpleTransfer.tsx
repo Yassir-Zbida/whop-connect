@@ -4,9 +4,11 @@ import { getSettings, createTransfer, getTransfers, getBalance, getBalances, typ
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 import {
-  buildBulkTransferAmounts,
+  buildFeeAwareBulkTransferAmounts,
   computeTransferAmounts,
+  estimateDebitFromGross,
   getEffectiveFeePct,
+  maxGrossForDebitBudget,
   MIN_TRANSFER_USD,
 } from '../utils/transfer-fees';
 import {
@@ -43,6 +45,10 @@ function formatCurrency(amount: number, currency: string) {
     style: 'currency',
     currency: (currency || 'usd').toUpperCase(),
   }).format(amount);
+}
+
+function round2(value: number) {
+  return Math.round(Number(value) * 100) / 100;
 }
 
 function BalanceStatCard({
@@ -286,9 +292,10 @@ export default function SimpleTransfer() {
     if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(per) || per <= 0 || per > total) {
       return null;
     }
-    const grossChunks = buildBulkTransferAmounts(total, per);
+    const grossChunks = buildFeeAwareBulkTransferAmounts(total, per, platformCommissionPct, feePct);
     if (!grossChunks.length) return null;
 
+    const perAmount = round2(per);
     const transfers = grossChunks.map((gross) =>
       computeTransferAmounts(gross, platformCommissionPct, feePct)
     );
@@ -296,6 +303,12 @@ export default function SimpleTransfer() {
     const totalGross = grossChunks.reduce((sum, g) => sum + g, 0);
     const totalAdjusted = transfers.reduce((sum, t) => sum + t.adjusted, 0);
     const totalCommission = transfers.reduce((sum, t) => sum + t.platformCommission, 0);
+    const totalEstimatedDebit = grossChunks.reduce(
+      (sum, g) => sum + estimateDebitFromGross(g, platformCommissionPct, feePct),
+      0
+    );
+    const lastChunkFeeAdjusted =
+      grossChunks.length > 0 && grossChunks[grossChunks.length - 1] < perAmount - 1e-9;
 
     return {
       count: grossChunks.length,
@@ -304,7 +317,10 @@ export default function SimpleTransfer() {
       totalGross,
       totalAdjusted,
       totalCommission,
+      totalEstimatedDebit,
       belowMinimum,
+      lastChunkFeeAdjusted,
+      perAmount,
     };
   }, [bulkTotalAmount, bulkPerAmount, platformCommissionPct, feePct]);
 
@@ -349,9 +365,17 @@ export default function SimpleTransfer() {
     const succeeded: Array<{ id: string; gross: number; adjusted: number }> = [];
     let failedAt: number | null = null;
     let failMessage = '';
+    let debitRemaining = total;
 
     for (let i = 0; i < bulkPreview.grossChunks.length; i++) {
-      const gross = bulkPreview.grossChunks[i];
+      let gross = bulkPreview.grossChunks[i];
+      const isLast = i === bulkPreview.grossChunks.length - 1;
+      if (isLast) {
+        const capped = maxGrossForDebitBudget(debitRemaining, platformCommissionPct, feePct);
+        if (capped > 0) gross = Math.min(gross, capped);
+      }
+      if (!(gross > 0)) continue;
+
       setBulkProgress({ current: i + 1, total: bulkPreview.count });
       try {
         const batchNote = bulkNotes.trim()
@@ -364,6 +388,11 @@ export default function SimpleTransfer() {
           notes: batchNote.slice(0, 50),
           metadata: { batch_transfer: true, batch_index: i + 1, batch_total: bulkPreview.count },
         });
+        const actualDebit =
+          res.sendable != null
+            ? round2(Number(res.sendable))
+            : estimateDebitFromGross(res.gross ?? gross, platformCommissionPct, feePct);
+        debitRemaining = round2(Math.max(0, debitRemaining - actualDebit));
         succeeded.push({
           id: res.id,
           gross: res.gross ?? gross,
@@ -438,7 +467,6 @@ export default function SimpleTransfer() {
               onChange={(e) => setOverviewCurrency(e.target.value)}
               disabled={!companyId || loadingBalances}
               aria-label="Balance currency"
-              style={{ minWidth: 160 }}
             >
               {overviewBalanceOptions.map((code) => (
                 <option key={code} value={code}>
@@ -607,9 +635,9 @@ export default function SimpleTransfer() {
           <div className="card-body">
             <p className="card-desc">
               Split a total amount into multiple transfers of a fixed size. For example, total{' '}
-              <strong>$20</strong> with <strong>$5</strong> per transfer sends 4 separate transfers. Each chunk is
-              debited from your balance; platform commission and Whop fees apply to every transfer, so the recipient
-              receives less than the gross per chunk.
+              <strong>$20</strong> with <strong>$5</strong> per transfer sends 4 separate transfers. Fees are
+              reserved up front — the last transfer is automatically reduced to the maximum amount that fits your
+              balance so the batch does not fail on the final chunk.
             </p>
             {!companyId ? (
               <div className="alert alert-error" style={{ marginTop: 12 }}>
@@ -707,16 +735,21 @@ export default function SimpleTransfer() {
                     <div style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.6 }}>
                       {bulkPreview.grossChunks.map((gross, i) => {
                         const t = bulkPreview.transfers[i];
+                        const isLast = i === bulkPreview.grossChunks.length - 1;
+                        const feeAdjusted =
+                          isLast &&
+                          (bulkPreview.lastChunkFeeAdjusted || gross < bulkPreview.perAmount - 1e-9);
                         return (
                           <div key={i}>
                             Transfer {i + 1}: {formatCurrency(gross, bulkCurrency)} gross → ~
                             {formatCurrency(t.adjusted, bulkCurrency)} received
-                            {gross !== parseFloat(bulkPerAmount) ? ' (remainder)' : ''}
+                            {feeAdjusted ? ' (fee-adjusted remainder)' : ''}
                           </div>
                         );
                       })}
                       <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
-                        Total gross: {formatCurrency(bulkPreview.totalGross, bulkCurrency)} · Estimated received:{' '}
+                        Total gross: {formatCurrency(bulkPreview.totalGross, bulkCurrency)} · Estimated debit:{' '}
+                        ~{formatCurrency(bulkPreview.totalEstimatedDebit, bulkCurrency)} · Estimated received:{' '}
                         ~{formatCurrency(bulkPreview.totalAdjusted, bulkCurrency)}
                         {bulkPreview.belowMinimum && (
                           <span style={{ color: 'var(--danger)', display: 'block', marginTop: 4 }}>
