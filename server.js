@@ -952,7 +952,7 @@ api.patch('/split-rules', requireAuth, async (req, res) => {
 
 api.post('/split-rules', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const { productId, planId, splits } = req.body ?? {};
+  const { productId, planId, splits, batch_enabled, batch_per_amount } = req.body ?? {};
   if (!Array.isArray(splits) || splits.length === 0) {
     return res.status(400).json({ error: 'Invalid request', message: 'splits array is required and must not be empty.' });
   }
@@ -965,12 +965,18 @@ api.post('/split-rules', requireAuth, async (req, res) => {
         destination_id: String(s.destination_id ?? '').trim(),
         percentage: Number(s.percentage) || 0,
       })),
+      batch_enabled: Boolean(batch_enabled),
+      batch_per_amount:
+        batch_per_amount != null && batch_per_amount !== '' ? Number(batch_per_amount) : null,
     });
   } catch (e) {
     if (e?.code === 'PRODUCT_IN_AUTO_TRANSFER') {
       return res.status(409).json({ error: 'Conflict', message: e.message, code: e.code });
     }
     if (e?.code === 'SPLIT_PERCENTAGE_EXCEEDS_100') {
+      return res.status(400).json({ error: 'Invalid request', message: e.message, code: e.code });
+    }
+    if (e?.code === 'INVALID_BATCH_AMOUNT') {
       return res.status(400).json({ error: 'Invalid request', message: e.message, code: e.code });
     }
     throw e;
@@ -1046,7 +1052,8 @@ api.patch('/auto-transfer', requireAuth, async (req, res) => {
 
 api.post('/auto-transfer/rules', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const { productId, planId, destination_id, transfer_type, value } = req.body ?? {};
+  const { productId, planId, destination_id, transfer_type, value, batch_enabled, batch_per_amount } =
+    req.body ?? {};
   const destId = String(destination_id ?? '').trim();
   if (!destId) {
     return res.status(400).json({ error: 'Invalid request', message: 'destination_id is required.' });
@@ -1059,10 +1066,16 @@ api.post('/auto-transfer/rules', requireAuth, async (req, res) => {
       destination_id: destId,
       transfer_type: transfer_type === 'fixed' ? 'fixed' : 'percentage',
       value: Number(value) || 0,
+      batch_enabled: Boolean(batch_enabled),
+      batch_per_amount:
+        batch_per_amount != null && batch_per_amount !== '' ? Number(batch_per_amount) : null,
     });
   } catch (e) {
     if (e?.code === 'PRODUCT_IN_AUTO_SPLIT') {
       return res.status(409).json({ error: 'Conflict', message: e.message, code: e.code });
+    }
+    if (e?.code === 'INVALID_BATCH_AMOUNT') {
+      return res.status(400).json({ error: 'Invalid request', message: e.message, code: e.code });
     }
     throw e;
   }

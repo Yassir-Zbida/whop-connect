@@ -1,8 +1,14 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Icon, IconPaths } from '../components/Icon';
 import { getSettings, createTransfer, getTransfers, type Transfer } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
+import {
+  buildBulkTransferAmounts,
+  computeTransferAmounts,
+  getEffectiveFeePct,
+  MIN_TRANSFER_USD,
+} from '../utils/transfer-fees';
 
 function formatDate(iso: string) {
   try {
@@ -21,20 +27,40 @@ function formatCurrency(amount: number, currency: string) {
 
 export default function SimpleTransfer() {
   const [companyId, setCompanyId] = useState<string | null>(null);
+  const [platformCommissionPct, setPlatformCommissionPct] = useState(1);
+  const [cachedFeePct, setCachedFeePct] = useState<number | null>(null);
   const [destinationId, setDestinationId] = useState('');
   const [amount, setAmount] = useState('');
   const [currency, setCurrency] = useState('usd');
   const [notes, setNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [msg, setMsg] = useState<{ text: string; error: boolean } | null>(null);
+  const [bulkDestinationId, setBulkDestinationId] = useState('');
+  const [bulkTotalAmount, setBulkTotalAmount] = useState('');
+  const [bulkPerAmount, setBulkPerAmount] = useState('');
+  const [bulkCurrency, setBulkCurrency] = useState('usd');
+  const [bulkNotes, setBulkNotes] = useState('');
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number } | null>(null);
+  const [bulkMsg, setBulkMsg] = useState<{ text: string; error: boolean } | null>(null);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [loadingTransfers, setLoadingTransfers] = useState(true);
   const { showToast } = useToast();
 
+  const feePct = getEffectiveFeePct(cachedFeePct);
+
   const loadSettings = () => {
     getSettings()
-      .then((s) => setCompanyId(s.whopCompanyId ?? null))
-      .catch(() => setCompanyId(null));
+      .then((s) => {
+        setCompanyId(s.whopCompanyId ?? null);
+        setPlatformCommissionPct(s.platformCommissionPct ?? 1);
+        setCachedFeePct(s.cachedFeePct ?? null);
+      })
+      .catch(() => {
+        setCompanyId(null);
+        setPlatformCommissionPct(1);
+        setCachedFeePct(null);
+      });
   };
 
   const loadTransfers = () => {
@@ -100,6 +126,135 @@ export default function SimpleTransfer() {
         showToast(text, 'error');
       })
       .finally(() => setSubmitting(false));
+  };
+
+  const bulkPreview = useMemo(() => {
+    const total = parseFloat(bulkTotalAmount);
+    const per = parseFloat(bulkPerAmount);
+    if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(per) || per <= 0 || per > total) {
+      return null;
+    }
+    const grossChunks = buildBulkTransferAmounts(total, per);
+    if (!grossChunks.length) return null;
+
+    const transfers = grossChunks.map((gross) =>
+      computeTransferAmounts(gross, platformCommissionPct, feePct)
+    );
+    const belowMinimum = transfers.find((t) => t.adjusted < MIN_TRANSFER_USD);
+    const totalGross = grossChunks.reduce((sum, g) => sum + g, 0);
+    const totalAdjusted = transfers.reduce((sum, t) => sum + t.adjusted, 0);
+    const totalCommission = transfers.reduce((sum, t) => sum + t.platformCommission, 0);
+
+    return {
+      count: grossChunks.length,
+      grossChunks,
+      transfers,
+      totalGross,
+      totalAdjusted,
+      totalCommission,
+      belowMinimum,
+    };
+  }, [bulkTotalAmount, bulkPerAmount, platformCommissionPct, feePct]);
+
+  const handleBulkSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const destId = bulkDestinationId.trim();
+    const total = parseFloat(bulkTotalAmount);
+    const per = parseFloat(bulkPerAmount);
+
+    if (!destId) {
+      setBulkMsg({ text: 'Enter destination (user_xxx, biz_xxx, or ldgr_xxx)', error: true });
+      return;
+    }
+    if (!Number.isFinite(total) || total <= 0) {
+      setBulkMsg({ text: 'Enter a valid total amount', error: true });
+      return;
+    }
+    if (!Number.isFinite(per) || per <= 0) {
+      setBulkMsg({ text: 'Enter a valid per-transfer amount', error: true });
+      return;
+    }
+    if (per > total) {
+      setBulkMsg({ text: 'Per-transfer amount cannot exceed total amount', error: true });
+      return;
+    }
+    if (!bulkPreview) {
+      setBulkMsg({ text: 'Could not build transfer plan', error: true });
+      return;
+    }
+    if (bulkPreview.belowMinimum) {
+      setBulkMsg({
+        text: `Each transfer must send at least $${MIN_TRANSFER_USD.toFixed(2)} after fees. Increase per-transfer amount or total.`,
+        error: true,
+      });
+      return;
+    }
+
+    setBulkMsg(null);
+    setBulkSubmitting(true);
+    setBulkProgress({ current: 0, total: bulkPreview.count });
+
+    const succeeded: Array<{ id: string; gross: number; adjusted: number }> = [];
+    let failedAt: number | null = null;
+    let failMessage = '';
+
+    for (let i = 0; i < bulkPreview.grossChunks.length; i++) {
+      const gross = bulkPreview.grossChunks[i];
+      setBulkProgress({ current: i + 1, total: bulkPreview.count });
+      try {
+        const batchNote = bulkNotes.trim()
+          ? `${bulkNotes.trim().slice(0, 40)} (${i + 1}/${bulkPreview.count})`
+          : `Batch ${i + 1}/${bulkPreview.count}`;
+        const res = await createTransfer({
+          destination_id: destId,
+          amount: gross,
+          currency: bulkCurrency || 'usd',
+          notes: batchNote.slice(0, 50),
+          metadata: { batch_transfer: true, batch_index: i + 1, batch_total: bulkPreview.count },
+        });
+        succeeded.push({
+          id: res.id,
+          gross: res.gross ?? gross,
+          adjusted: res.adjusted ?? gross,
+        });
+      } catch (err) {
+        failedAt = i + 1;
+        failMessage = err instanceof Error ? err.message : 'Transfer failed';
+        break;
+      }
+    }
+
+    setBulkSubmitting(false);
+    setBulkProgress(null);
+
+    if (failedAt != null) {
+      const partial =
+        succeeded.length > 0
+          ? ` Completed ${succeeded.length} of ${bulkPreview.count} before failure.`
+          : '';
+      const text = `Batch stopped at transfer ${failedAt}: ${failMessage}.${partial}`;
+      setBulkMsg({ text, error: true });
+      logError('Bulk transfer', text);
+      showToast(text, 'error');
+    } else {
+      const totalSent = succeeded.reduce((sum, t) => sum + t.adjusted, 0);
+      const text =
+        `Batch complete: ${succeeded.length} transfers sent (~${formatCurrency(totalSent, bulkCurrency)} received after fees, ` +
+        `${formatCurrency(bulkPreview.totalGross, bulkCurrency)} gross).`;
+      setBulkMsg({ text, error: false });
+      logSuccess('Bulk transfer', text, {
+        count: succeeded.length,
+        totalGross: bulkPreview.totalGross,
+        totalAdjusted: totalSent,
+        destination_id: destId,
+      });
+      showToast(text);
+      setBulkTotalAmount('');
+      setBulkPerAmount('');
+      setBulkNotes('');
+    }
+
+    loadTransfers();
   };
 
   return (
@@ -220,6 +375,158 @@ export default function SimpleTransfer() {
                 >
                   <Icon d={IconPaths.transfer} size={13} />
                   {submitting ? 'Sending…' : 'Create transfer'}
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Icon d={IconPaths.transfer} size={14} />
+              <span className="card-title">Bulk transfer (batch)</span>
+            </div>
+          </div>
+          <div className="card-body">
+            <p className="card-desc">
+              Split a total amount into multiple transfers of a fixed size. For example, total{' '}
+              <strong>$20</strong> with <strong>$5</strong> per transfer sends 4 separate transfers. Each chunk is
+              debited from your balance; platform commission and Whop fees apply to every transfer, so the recipient
+              receives less than the gross per chunk.
+            </p>
+            {!companyId ? (
+              <div className="alert alert-error" style={{ marginTop: 12 }}>
+                Set your Whop API key and Company ID in Settings first.
+              </div>
+            ) : (
+              <form onSubmit={handleBulkSubmit} style={{ marginTop: 16 }}>
+                <div className="field">
+                  <label className="field-label">Destination ID *</label>
+                  <input
+                    type="text"
+                    className="field-input monospace"
+                    placeholder="user_xxx, biz_xxx, or ldgr_xxx"
+                    value={bulkDestinationId}
+                    onChange={(e) => setBulkDestinationId(e.target.value)}
+                    autoComplete="off"
+                    disabled={bulkSubmitting}
+                  />
+                </div>
+                <div className="form-grid-3">
+                  <div className="field">
+                    <label className="field-label">Total amount *</label>
+                    <input
+                      type="number"
+                      className="field-input"
+                      placeholder="20.00"
+                      min="0.01"
+                      step="0.01"
+                      value={bulkTotalAmount}
+                      onChange={(e) => setBulkTotalAmount(e.target.value)}
+                      disabled={bulkSubmitting}
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">Per transfer amount *</label>
+                    <input
+                      type="number"
+                      className="field-input"
+                      placeholder="5.00"
+                      min="0.01"
+                      step="0.01"
+                      value={bulkPerAmount}
+                      onChange={(e) => setBulkPerAmount(e.target.value)}
+                      disabled={bulkSubmitting}
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">Currency</label>
+                    <select
+                      className="select-native"
+                      value={bulkCurrency}
+                      onChange={(e) => setBulkCurrency(e.target.value)}
+                      disabled={bulkSubmitting}
+                    >
+                      <option value="usd">USD — US Dollar</option>
+                      <option value="eur">EUR — Euro</option>
+                      <option value="gbp">GBP — British Pound</option>
+                      <option value="sgd">SGD — Singapore Dollar</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="field">
+                  <label className="field-label">Notes (optional)</label>
+                  <input
+                    type="text"
+                    className="field-input"
+                    placeholder="e.g. Weekly payout batch"
+                    maxLength={40}
+                    value={bulkNotes}
+                    onChange={(e) => setBulkNotes(e.target.value)}
+                    disabled={bulkSubmitting}
+                  />
+                </div>
+
+                {bulkPreview && (
+                  <div
+                    className="alert"
+                    style={{
+                      marginBottom: 14,
+                      background: 'var(--surface-2)',
+                      border: '1px solid var(--border)',
+                      color: 'var(--text)',
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                      Plan: {bulkPreview.count} transfer{bulkPreview.count !== 1 ? 's' : ''}
+                    </div>
+                    <div style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.6 }}>
+                      {bulkPreview.grossChunks.map((gross, i) => {
+                        const t = bulkPreview.transfers[i];
+                        return (
+                          <div key={i}>
+                            Transfer {i + 1}: {formatCurrency(gross, bulkCurrency)} gross → ~
+                            {formatCurrency(t.adjusted, bulkCurrency)} received
+                            {gross !== parseFloat(bulkPerAmount) ? ' (remainder)' : ''}
+                          </div>
+                        );
+                      })}
+                      <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                        Total gross: {formatCurrency(bulkPreview.totalGross, bulkCurrency)} · Estimated received:{' '}
+                        ~{formatCurrency(bulkPreview.totalAdjusted, bulkCurrency)}
+                        {bulkPreview.belowMinimum && (
+                          <span style={{ color: 'var(--danger)', display: 'block', marginTop: 4 }}>
+                            One or more transfers fall below the ${MIN_TRANSFER_USD.toFixed(2)} minimum after fees.
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {bulkProgress && (
+                  <div className="alert" style={{ marginBottom: 14 }}>
+                    Sending transfer {bulkProgress.current} of {bulkProgress.total}…
+                  </div>
+                )}
+
+                {bulkMsg && (
+                  <div className={`alert ${bulkMsg.error ? 'alert-error' : 'alert-success'}`}>{bulkMsg.text}</div>
+                )}
+
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={bulkSubmitting || !companyId || !bulkPreview || Boolean(bulkPreview?.belowMinimum)}
+                  style={{ gap: 7 }}
+                >
+                  <Icon d={IconPaths.transfer} size={13} />
+                  {bulkSubmitting
+                    ? bulkProgress
+                      ? `Sending ${bulkProgress.current}/${bulkProgress.total}…`
+                      : 'Starting batch…'
+                    : `Start batch (${bulkPreview?.count ?? 0} transfers)`}
                 </button>
               </form>
             )}

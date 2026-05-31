@@ -579,7 +579,9 @@ export async function setAutoSplitEnabled(userId, enabled) {
 
 export async function getAutoSplitRules(userId) {
   const rules = await query(
-    `SELECT r.id, r.product_id AS productId, r.plan_id AS planId, r.created_at AS createdAt
+    `SELECT r.id, r.product_id AS productId, r.plan_id AS planId,
+            r.batch_enabled AS batchEnabled, r.batch_per_amount AS batchPerAmount,
+            r.created_at AS createdAt
      FROM auto_split_rules r
      WHERE r.user_id = ?
      ORDER BY r.created_at ASC`,
@@ -603,6 +605,11 @@ export async function getAutoSplitRules(userId) {
     id: r.id,
     productId: r.productId || null,
     planId: r.planId || null,
+    batch_enabled: Boolean(r.batchEnabled),
+    batch_per_amount:
+      r.batchPerAmount != null && Number.isFinite(Number(r.batchPerAmount))
+        ? Number(r.batchPerAmount)
+        : null,
     createdAt: r.createdAt,
     splits: byRule[r.id] || [],
   }));
@@ -627,7 +634,7 @@ export function validateSplitPercentages(splits) {
   }
 }
 
-export async function createAutoSplitRule(userId, { productId, planId, splits }) {
+export async function createAutoSplitRule(userId, { productId, planId, splits, batch_enabled, batch_per_amount }) {
   if (!splits || !splits.length) return null;
   const validSplits = splits.filter((s) => {
     const dest = String(s.destination_id ?? '').trim();
@@ -637,11 +644,21 @@ export async function createAutoSplitRule(userId, { productId, planId, splits })
   if (!validSplits.length) return null;
   validateSplitPercentages(validSplits);
   await assertProductNotInAutoTransfer(userId, productId);
+  const batchEnabled = Boolean(batch_enabled);
+  const batchPer =
+    batchEnabled && batch_per_amount != null && Number(batch_per_amount) > 0
+      ? Number(batch_per_amount)
+      : null;
+  if (batchEnabled && (!batchPer || batchPer <= 0)) {
+    const err = new Error('batch_per_amount must be a positive number when batch is enabled.');
+    err.code = 'INVALID_BATCH_AMOUNT';
+    throw err;
+  }
   const id = 'rule_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
   const p = getPool();
   await p.execute(
-    'INSERT INTO auto_split_rules (id, user_id, product_id, plan_id) VALUES (?, ?, ?, ?)',
-    [id, userId, productId?.trim() || null, planId?.trim() || null]
+    'INSERT INTO auto_split_rules (id, user_id, product_id, plan_id, batch_enabled, batch_per_amount) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, userId, productId?.trim() || null, planId?.trim() || null, batchEnabled ? 1 : 0, batchPer]
   );
   for (const s of validSplits) {
     const dest = String(s.destination_id ?? '').trim();
@@ -719,7 +736,9 @@ export async function setAutoTransferEnabled(userId, enabled) {
 export async function getAutoTransferRules(userId) {
   const rules = await query(
     `SELECT id, product_id AS productId, plan_id AS planId, destination_id AS destinationId,
-            transfer_type AS transferType, value, created_at AS createdAt
+            transfer_type AS transferType, value,
+            batch_enabled AS batchEnabled, batch_per_amount AS batchPerAmount,
+            created_at AS createdAt
      FROM auto_transfer_rules
      WHERE user_id = ?
      ORDER BY created_at ASC`,
@@ -732,6 +751,11 @@ export async function getAutoTransferRules(userId) {
     destination_id: r.destinationId,
     transfer_type: r.transferType || 'percentage',
     value: Number(r.value),
+    batch_enabled: Boolean(r.batchEnabled),
+    batch_per_amount:
+      r.batchPerAmount != null && Number.isFinite(Number(r.batchPerAmount))
+        ? Number(r.batchPerAmount)
+        : null,
     createdAt: r.createdAt,
   }));
 }
@@ -800,21 +824,56 @@ async function assertProductNotInAutoTransfer(userId, productId) {
   }
 }
 
-export async function createAutoTransferRule(userId, { productId, planId, destination_id, transfer_type, value }) {
+export async function createAutoTransferRule(
+  userId,
+  { productId, planId, destination_id, transfer_type, value, batch_enabled, batch_per_amount }
+) {
   const destId = String(destination_id ?? '').trim();
   if (!destId) return null;
   const typeVal = transfer_type === 'fixed' ? 'fixed' : 'percentage';
   const numVal = Number(value);
   if (!Number.isFinite(numVal) || numVal <= 0) return null;
   if (typeVal === 'percentage' && numVal > 100) return null;
+  const batchEnabled = Boolean(batch_enabled);
+  const batchPer =
+    batchEnabled && batch_per_amount != null && Number(batch_per_amount) > 0
+      ? Number(batch_per_amount)
+      : null;
+  if (batchEnabled && (!batchPer || batchPer <= 0)) {
+    const err = new Error('batch_per_amount must be a positive number when batch is enabled.');
+    err.code = 'INVALID_BATCH_AMOUNT';
+    throw err;
+  }
   await assertProductNotInAutoSplit(userId, productId);
   const id = 'atr_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
   await getPool().execute(
-    'INSERT INTO auto_transfer_rules (id, user_id, product_id, plan_id, destination_id, transfer_type, value) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [id, userId, productId?.trim() || null, planId?.trim() || null, destId, typeVal, numVal]
+    'INSERT INTO auto_transfer_rules (id, user_id, product_id, plan_id, destination_id, transfer_type, value, batch_enabled, batch_per_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      userId,
+      productId?.trim() || null,
+      planId?.trim() || null,
+      destId,
+      typeVal,
+      numVal,
+      batchEnabled ? 1 : 0,
+      batchPer,
+    ]
   );
   const rules = await getAutoTransferRules(userId);
-  return rules.find((r) => r.id === id) || { id, productId: productId || null, planId: planId || null, destination_id: destId, transfer_type: typeVal, value: numVal, createdAt: new Date().toISOString() };
+  return (
+    rules.find((r) => r.id === id) || {
+      id,
+      productId: productId || null,
+      planId: planId || null,
+      destination_id: destId,
+      transfer_type: typeVal,
+      value: numVal,
+      batch_enabled: batchEnabled,
+      batch_per_amount: batchPer,
+      createdAt: new Date().toISOString(),
+    }
+  );
 }
 
 export async function deleteAutoTransferRule(ruleId, userId) {

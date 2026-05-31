@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { Icon, IconPaths } from '../components/Icon';
-import { getSettings, updateSettings, pollPaymentsNow, processPaymentQueueNow } from '../api';
+import { getSettings, updateSettings } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 
@@ -25,18 +25,6 @@ export default function Settings() {
   const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
   const [platformCommissionPct, setPlatformCommissionPct] = useState('1');
   const [cachedFeePct, setCachedFeePct] = useState<number | null>(null);
-  const [pollEnabled, setPollEnabled] = useState(true);
-  const [pollTickMs, setPollTickMs] = useState('60000');
-  const [pollParallel, setPollParallel] = useState('5');
-  const [workerEnabled, setWorkerEnabled] = useState(true);
-  const [workerConcurrency, setWorkerConcurrency] = useState('5');
-  const [workerPending, setWorkerPending] = useState(0);
-  const [workerProcessing, setWorkerProcessing] = useState(0);
-  const [processingQueue, setProcessingQueue] = useState(false);
-  const [pollsTotal, setPollsTotal] = useState(0);
-  const [lastPollAt, setLastPollAt] = useState<string | null>(null);
-  const [lastPollError, setLastPollError] = useState<string | null>(null);
-  const [pollingNow, setPollingNow] = useState(false);
   const [msgWhop, setMsgWhop] = useState<{ text: string; error: boolean } | null>(null);
   const [msgPassword, setMsgPassword] = useState<{ text: string; error: boolean } | null>(null);
   const { showToast } = useToast();
@@ -51,16 +39,6 @@ export default function Settings() {
         setWebhookSecretSet(Boolean(s.whopWebhookSecretSet));
         setPlatformCommissionPct(String(s.platformCommissionPct ?? 1));
         setCachedFeePct(s.cachedFeePct ?? null);
-        setPollEnabled(s.pollEnabled !== false);
-        setPollTickMs(String(s.pollTickMs ?? (s.pollIntervalSeconds ?? 60) * 1000));
-        setPollParallel(String(s.pollParallel ?? 5));
-        setWorkerEnabled(s.workerEnabled !== false);
-        setWorkerConcurrency(String(s.workerConcurrency ?? 5));
-        setWorkerPending(s.workerQueue?.pending ?? 0);
-        setWorkerProcessing(s.workerQueue?.processing ?? 0);
-        setPollsTotal(s.pollsTotal ?? 0);
-        setLastPollAt(s.lastPollAt ?? null);
-        setLastPollError(s.lastPollError ?? null);
       })
       .catch(() => setMsgWhop({ text: 'Failed to load settings', error: true }))
       .finally(() => setLoading(false));
@@ -77,30 +55,6 @@ export default function Settings() {
       setMsgWhop({ text: 'Platform commission must be between 0 and 100.', error: true });
       return;
     }
-    const tickNum = parseInt(pollTickMs, 10);
-    const parallelNum = parseInt(pollParallel, 10);
-    const workerConcurrencyNum = parseInt(workerConcurrency, 10);
-    if (
-      pollTickMs.trim() !== '' &&
-      (!Number.isFinite(tickNum) || tickNum < 1000 || tickNum > 86400000)
-    ) {
-      setMsgWhop({ text: 'Poll interval must be between 1000 and 86400000 milliseconds.', error: true });
-      return;
-    }
-    if (
-      pollParallel.trim() !== '' &&
-      (!Number.isFinite(parallelNum) || parallelNum < 1 || parallelNum > 50)
-    ) {
-      setMsgWhop({ text: 'Max parallel enqueues must be between 1 and 50.', error: true });
-      return;
-    }
-    if (
-      workerConcurrency.trim() !== '' &&
-      (!Number.isFinite(workerConcurrencyNum) || workerConcurrencyNum < 1 || workerConcurrencyNum > 50)
-    ) {
-      setMsgWhop({ text: 'Max parallel worker jobs must be between 1 and 50.', error: true });
-      return;
-    }
     setSavingWhop(true);
     try {
       await updateSettings({
@@ -108,11 +62,6 @@ export default function Settings() {
         ...(whopCompanyId.trim() && { whopCompanyId: whopCompanyId.trim() }),
         ...(whopWebhookSecret.trim() && { whopWebhookSecret: whopWebhookSecret.trim() }),
         ...(platformCommissionPct.trim() !== '' && { platformCommissionPct: commissionNum }),
-        pollEnabled,
-        pollTickMs: tickNum,
-        pollParallel: parallelNum,
-        workerEnabled,
-        workerConcurrency: workerConcurrencyNum,
       });
       logSuccess('Settings', 'Whop API & Company saved');
       showToast('Whop settings saved');
@@ -127,16 +76,6 @@ export default function Settings() {
         setWebhookSecretSet(Boolean(s.whopWebhookSecretSet));
         setPlatformCommissionPct(String(s.platformCommissionPct ?? 1));
         setCachedFeePct(s.cachedFeePct ?? null);
-        setPollEnabled(s.pollEnabled !== false);
-        setPollTickMs(String(s.pollTickMs ?? (s.pollIntervalSeconds ?? 60) * 1000));
-        setPollParallel(String(s.pollParallel ?? 5));
-        setWorkerEnabled(s.workerEnabled !== false);
-        setWorkerConcurrency(String(s.workerConcurrency ?? 5));
-        setWorkerPending(s.workerQueue?.pending ?? 0);
-        setWorkerProcessing(s.workerQueue?.processing ?? 0);
-        setPollsTotal(s.pollsTotal ?? 0);
-        setLastPollAt(s.lastPollAt ?? null);
-        setLastPollError(s.lastPollError ?? null);
       });
     } catch (err) {
       const text = err instanceof Error ? err.message : 'Failed to save';
@@ -145,57 +84,6 @@ export default function Settings() {
       showToast(text, 'error');
     } finally {
       setSavingWhop(false);
-    }
-  };
-
-  const handlePollNow = async () => {
-    setPollingNow(true);
-    setMsgWhop(null);
-    try {
-      const res = await pollPaymentsNow();
-      const text =
-        res.message ||
-        (res.firstPoll
-          ? 'First poll recorded. Future polls will process new payments.'
-          : `Queued ${res.queued}, skipped ${res.skipped}.`);
-      setMsgWhop({ text, error: !res.ok && (res.errors?.length ?? 0) > 0 });
-      showToast(text, !res.ok && (res.errors?.length ?? 0) > 0 ? 'error' : 'success');
-      if (res.ok) logSuccess('Payment poll', text, res);
-      else logError('Payment poll', text, res);
-      const s = await getSettings();
-      setPollsTotal(s.pollsTotal ?? 0);
-      setLastPollAt(s.lastPollAt ?? null);
-      setLastPollError(s.lastPollError ?? null);
-    } catch (err) {
-      const text = err instanceof Error ? err.message : 'Poll failed';
-      setMsgWhop({ text, error: true });
-      showToast(text, 'error');
-      logError('Payment poll', text);
-    } finally {
-      setPollingNow(false);
-    }
-  };
-
-  const handleProcessQueue = async () => {
-    setProcessingQueue(true);
-    setMsgWhop(null);
-    try {
-      const res = await processPaymentQueueNow();
-      const text = res.message || `Processed ${res.processed} payment(s).`;
-      setMsgWhop({ text, error: !res.ok && (res.failed ?? 0) > 0 });
-      showToast(text, !res.ok && (res.failed ?? 0) > 0 ? 'error' : 'success');
-      if (res.ok) logSuccess('Payment worker', text, res);
-      else logError('Payment worker', text, res);
-      const s = await getSettings();
-      setWorkerPending(s.workerQueue?.pending ?? 0);
-      setWorkerProcessing(s.workerQueue?.processing ?? 0);
-    } catch (err) {
-      const text = err instanceof Error ? err.message : 'Process queue failed';
-      setMsgWhop({ text, error: true });
-      showToast(text, 'error');
-      logError('Payment worker', text);
-    } finally {
-      setProcessingQueue(false);
     }
   };
 
@@ -420,189 +308,6 @@ export default function Settings() {
                   Whop transfer fee: ~{(cachedFeePct * 100).toFixed(1)}% (auto-learned from past transfers)
                 </p>
               )}
-              <div
-                className="card"
-                style={{
-                  marginTop: 16,
-                  padding: 16,
-                  background: 'var(--surface-2)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 8,
-                }}
-              >
-                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12 }}>Payment poller</div>
-                <p className="card-desc" style={{ marginTop: 0, marginBottom: 14 }}>
-                  Polls Whop for new paid payments when auto-split or auto-transfer is enabled. Manual &quot;Poll now&quot; works even when the background poller is off.
-                </p>
-                <label
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 10,
-                    marginBottom: 14,
-                    cursor: 'pointer',
-                    fontSize: 14,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={pollEnabled}
-                    onChange={(e) => setPollEnabled(e.target.checked)}
-                    disabled={savingWhop}
-                  />
-                  <span>
-                    <strong>Enable background poller</strong>
-                    <span style={{ display: 'block', fontSize: 12, color: 'var(--text-2)', fontWeight: 400 }}>
-                      Automatically check Whop for new payments on a schedule.
-                    </span>
-                  </span>
-                </label>
-                <div className="field">
-                  <label className="field-label">Poll interval (milliseconds)</label>
-                  <input
-                    className="field-input"
-                    type="number"
-                    min="1000"
-                    max="86400000"
-                    step="1000"
-                    placeholder="60000"
-                    value={pollTickMs}
-                    onChange={(e) => setPollTickMs(e.target.value)}
-                    disabled={savingWhop}
-                  />
-                  <p style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>
-                    Minimum time between polls for your account (default 60000 = 60 seconds).
-                  </p>
-                </div>
-                <div className="field">
-                  <label className="field-label">Max parallel enqueues per poll</label>
-                  <input
-                    className="field-input"
-                    type="number"
-                    min="1"
-                    max="50"
-                    step="1"
-                    placeholder="5"
-                    value={pollParallel}
-                    onChange={(e) => setPollParallel(e.target.value)}
-                    disabled={savingWhop}
-                  />
-                  <p style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>
-                    How many payments to queue at once per poll cycle (default 5).
-                  </p>
-                </div>
-              </div>
-              <div
-                style={{
-                  marginTop: 16,
-                  paddingTop: 16,
-                  borderTop: '1px solid var(--border)',
-                }}
-              >
-                <p style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: 'var(--text)' }}>
-                  Payment worker
-                </p>
-                <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 12 }}>
-                  Processes webhooks and polled payments in the background (auto-split / auto-transfer). When disabled, payments stay queued until you click Process queue.
-                </p>
-                <label
-                  style={{
-                    display: 'flex',
-                    alignItems: 'flex-start',
-                    gap: 10,
-                    marginBottom: 14,
-                    cursor: 'pointer',
-                    fontSize: 14,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={workerEnabled}
-                    onChange={(e) => setWorkerEnabled(e.target.checked)}
-                    disabled={savingWhop}
-                  />
-                  <span>
-                    <strong>Enable background worker</strong>
-                    <span style={{ display: 'block', fontSize: 12, color: 'var(--text-2)', fontWeight: 400 }}>
-                      Automatically process queued payments for your account.
-                    </span>
-                  </span>
-                </label>
-                <div className="field">
-                  <label className="field-label">Max parallel jobs</label>
-                  <input
-                    className="field-input"
-                    type="number"
-                    min="1"
-                    max="50"
-                    step="1"
-                    placeholder="5"
-                    value={workerConcurrency}
-                    onChange={(e) => setWorkerConcurrency(e.target.value)}
-                    disabled={savingWhop}
-                  />
-                  <p style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>
-                    How many queued payments to process at once for your account (default 5).
-                  </p>
-                </div>
-              </div>
-              <div
-                style={{
-                  marginTop: 12,
-                  paddingTop: 12,
-                  borderTop: '1px solid var(--border)',
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  gap: 12,
-                  alignItems: 'center',
-                }}
-              >
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={handlePollNow}
-                  disabled={pollingNow || savingWhop}
-                  style={{ gap: 6 }}
-                >
-                  <Icon d={IconPaths.refresh} size={12} />
-                  {pollingNow ? 'Polling…' : 'Poll now'}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={handleProcessQueue}
-                  disabled={processingQueue || savingWhop}
-                  style={{ gap: 6 }}
-                >
-                  <Icon d={IconPaths.refresh} size={12} />
-                  {processingQueue ? 'Processing…' : 'Process queue'}
-                </button>
-                <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
-                  {lastPollAt ? (
-                    <>
-                      Last poll: {new Date(lastPollAt).toLocaleString()} · {pollsTotal} total
-                      {pollEnabled ? '' : ' · background poller off'}
-                    </>
-                  ) : (
-                    <>No poll yet — first poll records start time only</>
-                  )}
-                  {(workerPending > 0 || workerProcessing > 0) && (
-                    <span style={{ display: 'block', marginTop: 4 }}>
-                      Queue: {workerPending} pending
-                      {workerProcessing > 0 ? ` · ${workerProcessing} processing` : ''}
-                      {workerEnabled ? '' : ' · background worker off'}
-                    </span>
-                  )}
-                  {!workerPending && !workerProcessing && !workerEnabled && (
-                    <span style={{ display: 'block', marginTop: 4 }}>Background worker off</span>
-                  )}
-                  {lastPollError && (
-                    <span style={{ color: 'var(--danger)', display: 'block', marginTop: 4 }}>
-                      Last error: {lastPollError}
-                    </span>
-                  )}
-                </div>
-              </div>
               <button className="btn btn-primary" type="submit" disabled={savingWhop} style={{ marginTop: 8 }}>
                 {savingWhop ? 'Saving…' : 'Save settings'}
               </button>

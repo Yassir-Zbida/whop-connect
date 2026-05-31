@@ -17,7 +17,7 @@ import { Icon, IconPaths } from '../components/Icon';
 import { getUserAnalytics } from '../api';
 import type { UserAnalytics } from '../api';
 
-type Tab = 'overview' | 'workflows' | 'activity';
+type Tab = 'overview' | 'workflows';
 
 ChartJS.register(
   CategoryScale,
@@ -64,14 +64,6 @@ function formatShortDate(isoDate: string) {
     return new Date(isoDate).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
   } catch {
     return isoDate;
-  }
-}
-
-function formatDateTime(iso: string) {
-  try {
-    return new Date(iso).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
-  } catch {
-    return iso;
   }
 }
 
@@ -267,7 +259,6 @@ export default function UserAnalytics() {
           [
             ['overview', 'Overview'],
             ['workflows', 'Split & transfer'],
-            ['activity', 'Recent activity'],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -292,57 +283,6 @@ export default function UserAnalytics() {
           <div className="card">
             <div className="card-body">
               <p style={{ color: 'var(--red)' }}>Failed to load analytics.</p>
-            </div>
-          </div>
-        ) : tab === 'activity' ? (
-          <div className="card">
-            <div className="card-header">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Icon d={IconPaths.terminal} size={14} />
-                <span className="card-title">Recent activity</span>
-              </div>
-            </div>
-            <div className="card-body" style={{ padding: 0, overflowX: 'auto' }}>
-              <table className="metrics-table">
-                <thead>
-                  <tr>
-                    <th>When</th>
-                    <th>Action</th>
-                    <th>Message</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(data.recentActivity || []).length === 0 ? (
-                    <tr>
-                      <td colSpan={3} style={{ color: 'var(--text-2)', padding: 16 }}>
-                        No activity recorded yet.
-                      </td>
-                    </tr>
-                  ) : (
-                    data.recentActivity.map((row) => (
-                      <tr key={row.id}>
-                        <td style={{ whiteSpace: 'nowrap', color: 'var(--text-2)', fontSize: 13 }}>
-                          {formatDateTime(row.created_at)}
-                        </td>
-                        <td>
-                          <span
-                            style={{
-                              fontSize: 12,
-                              padding: '2px 8px',
-                              borderRadius: 4,
-                              background: 'var(--surface-3)',
-                              border: '1px solid var(--border)',
-                            }}
-                          >
-                            {ACTION_LABELS[row.action] || row.action}
-                          </span>
-                        </td>
-                        <td style={{ fontSize: 13 }}>{row.message || '—'}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
             </div>
           </div>
         ) : tab === 'workflows' ? (

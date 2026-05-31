@@ -90,6 +90,12 @@ export default function DashboardLayout({ user, onLogout }: Props) {
                 </span>
                 Auto transfer
               </NavLink>
+              <NavLink to="/payment-poller" className={navClass}>
+                <span className="nav-icon">
+                  <Icon d={IconPaths.refresh} size={14} />
+                </span>
+                Payment poller
+              </NavLink>
               <NavLink to="/products" className={navClass}>
                 <span className="nav-icon">
                   <Icon d={IconPaths.package} size={14} />

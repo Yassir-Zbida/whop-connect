@@ -213,7 +213,7 @@ export async function createTransfer(body: {
   amount: number;
   currency?: string;
   destination_id: string;
-  metadata?: { order_id?: string };
+  metadata?: { order_id?: string; batch_transfer?: boolean; batch_index?: number; batch_total?: number };
   notes?: string;
 }): Promise<{
   id: string;
@@ -236,6 +236,8 @@ export type SplitRule = {
   productId: string | null;
   planId: string | null;
   splits: Array<{ destination_id: string; percentage: number }>;
+  batch_enabled?: boolean;
+  batch_per_amount?: number | null;
   createdAt: string;
 };
 
@@ -254,6 +256,8 @@ export async function createSplitRule(body: {
   productId?: string | null;
   planId?: string | null;
   splits: Array<{ destination_id: string; percentage: number }>;
+  batch_enabled?: boolean;
+  batch_per_amount?: number | null;
 }): Promise<SplitRule> {
   return request<SplitRule>('/api/split-rules', { method: 'POST', body: JSON.stringify(body) });
 }
@@ -305,6 +309,8 @@ export type AutoTransferRule = {
   destination_id: string;
   transfer_type: 'percentage' | 'fixed';
   value: number;
+  batch_enabled?: boolean;
+  batch_per_amount?: number | null;
   createdAt: string;
 };
 
@@ -329,6 +335,8 @@ export async function createAutoTransferRule(body: {
   destination_id: string;
   transfer_type: 'percentage' | 'fixed';
   value: number;
+  batch_enabled?: boolean;
+  batch_per_amount?: number | null;
 }): Promise<AutoTransferRule> {
   return request<AutoTransferRule>('/api/auto-transfer/rules', { method: 'POST', body: JSON.stringify(body) });
 }

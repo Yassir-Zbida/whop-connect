@@ -52,6 +52,8 @@ export default function AutoSplit() {
   const [addSplits, setAddSplits] = useState<Array<{ destination_id: string; percentage: string }>>([
     { destination_id: '', percentage: '' },
   ]);
+  const [addBatchEnabled, setAddBatchEnabled] = useState(false);
+  const [addBatchPerAmount, setAddBatchPerAmount] = useState('');
   const [addLoading, setAddLoading] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
   const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
@@ -178,12 +180,21 @@ export default function AutoSplit() {
       showToast(text, 'error');
       return;
     }
+    const batchPer = parseFloat(addBatchPerAmount);
+    if (addBatchEnabled && (!Number.isFinite(batchPer) || batchPer <= 0)) {
+      const text = 'Enter a valid per-transfer amount for batch mode.';
+      setMsg({ text, error: true });
+      showToast(text, 'error');
+      return;
+    }
     setAddLoading(true);
     try {
       await createSplitRule({
         productId: addProductId.trim() || null,
         planId: addPlanId.trim() || null,
         splits,
+        batch_enabled: addBatchEnabled,
+        batch_per_amount: addBatchEnabled ? batchPer : null,
       });
       setMsg({ text: 'Rule added.', error: false });
       logSuccess('Add split rule', 'Rule added.', { productId: addProductId || null, splitsCount: splits.length });
@@ -191,6 +202,8 @@ export default function AutoSplit() {
       setAddProductId('');
       setAddPlanId('');
       setAddSplits([{ destination_id: '', percentage: '' }]);
+      setAddBatchEnabled(false);
+      setAddBatchPerAmount('');
       load();
     } catch (err) {
       const text = err instanceof Error ? err.message : 'Failed to add rule';
@@ -421,6 +434,7 @@ export default function AutoSplit() {
                 >
                   <div style={{ flex: 2 }}>Product / Plan</div>
                   <div style={{ flex: 2 }}>Splits</div>
+                  <div style={{ flex: 1 }}>Batch</div>
                   <div style={{ flex: 1 }}>Actions</div>
                 </div>
                 {rules.map((r) => (
@@ -443,6 +457,11 @@ export default function AutoSplit() {
                           {companyTitle(s.destination_id)}: {s.percentage}%
                         </span>
                       ))}
+                    </div>
+                    <div style={{ flex: 1, fontSize: 13, color: 'var(--text-2)' }}>
+                      {r.batch_enabled && r.batch_per_amount
+                        ? `$${r.batch_per_amount}/transfer`
+                        : '—'}
                     </div>
                     <div style={{ flex: 1 }}>
                       <button
@@ -470,7 +489,7 @@ export default function AutoSplit() {
           </div>
           <div className="card-body">
             <p className="card-desc">
-              Criteria: product (optional — leave empty to match any product) and optional plan ID. Then add one or more destinations with percentage of the payment to send.
+              Criteria: product (optional — leave empty to match any product) and optional plan ID. Then add one or more destinations with percentage of the payment to send. Batch mode splits each destination&apos;s share into multiple smaller transfers.
             </p>
             <form onSubmit={handleAddRule}>
               <div className="form-grid-2">
@@ -559,6 +578,54 @@ export default function AutoSplit() {
                 <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 8 }} onClick={addSplitRow}>
                   <Icon d={IconPaths.plus} size={12} /> Add destination
                 </button>
+              </div>
+              <div
+                style={{
+                  marginTop: 16,
+                  padding: 14,
+                  background: 'var(--surface-2)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                }}
+              >
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 10,
+                    cursor: 'pointer',
+                    fontSize: 14,
+                    marginBottom: addBatchEnabled ? 12 : 0,
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={addBatchEnabled}
+                    onChange={(e) => setAddBatchEnabled(e.target.checked)}
+                    disabled={addLoading}
+                  />
+                  <span>
+                    <strong>Bulk transfer (batch)</strong>
+                    <span style={{ display: 'block', fontSize: 12, color: 'var(--text-2)', fontWeight: 400 }}>
+                      Split each destination&apos;s share into multiple transfers. E.g. 50% of $20 = $10, with $5 per transfer sends 2 transfers to that destination.
+                    </span>
+                  </span>
+                </label>
+                {addBatchEnabled && (
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">Per transfer amount (gross) *</label>
+                    <input
+                      className="field-input"
+                      type="number"
+                      step="0.01"
+                      min="0.01"
+                      placeholder="5.00"
+                      value={addBatchPerAmount}
+                      onChange={(e) => setAddBatchPerAmount(e.target.value)}
+                      disabled={addLoading}
+                    />
+                  </div>
+                )}
               </div>
               <button
                 className="btn btn-primary"
