@@ -140,32 +140,43 @@ function normalizeWhopError(err, fallbackMessage) {
   return { status: 500, message: raw };
 }
 
-/** Transferable ledger balance for a company in a given currency (balance minus reserve). */
-async function getCompanyTransferableBalance(whop, companyId, currency = 'usd') {
-  const ledger = await whop.ledgerAccounts.retrieve(companyId);
-  const balances = Array.isArray(ledger?.balances) ? ledger.balances : [];
-  const cur = String(currency || 'usd').toLowerCase();
-  const entry = balances.find((b) => String(b.currency || '').toLowerCase() === cur);
-  if (!entry) {
-    return {
-      currency: cur,
-      balance: 0,
-      pending_balance: 0,
-      reserve_balance: 0,
-      transferable: 0,
-    };
-  }
-  const balance = Number(entry.balance) || 0;
-  const pending = Number(entry.pending_balance) || 0;
-  const reserve = Number(entry.reserve_balance) || 0;
+function normalizeLedgerBalanceEntry(entry) {
+  const balance = Number(entry?.balance) || 0;
+  const pending = Number(entry?.pending_balance) || 0;
+  const reserve = Number(entry?.reserve_balance) || 0;
   const transferable = Math.max(0, balance - reserve);
   return {
-    currency: cur,
+    currency: String(entry?.currency || 'usd').toLowerCase(),
     balance,
     pending_balance: pending,
     reserve_balance: reserve,
     transferable: Math.floor(transferable * 100) / 100,
   };
+}
+
+function emptyLedgerBalance(currency = 'usd') {
+  const cur = String(currency || 'usd').toLowerCase();
+  return {
+    currency: cur,
+    balance: 0,
+    pending_balance: 0,
+    reserve_balance: 0,
+    transferable: 0,
+  };
+}
+
+/** All ledger balances for a company. */
+async function getCompanyLedgerBalances(whop, companyId) {
+  const ledger = await whop.ledgerAccounts.retrieve(companyId);
+  const balances = Array.isArray(ledger?.balances) ? ledger.balances : [];
+  return balances.map(normalizeLedgerBalanceEntry);
+}
+
+/** Transferable ledger balance for a company in a given currency (balance minus reserve). */
+async function getCompanyTransferableBalance(whop, companyId, currency = 'usd') {
+  const balances = await getCompanyLedgerBalances(whop, companyId);
+  const cur = String(currency || 'usd').toLowerCase();
+  return balances.find((b) => b.currency === cur) || emptyLedgerBalance(cur);
 }
 
 /** Reserve status for a connected account (ledger + optional company field). */
@@ -765,10 +776,14 @@ api.get('/balance', requireAuth, async (req, res) => {
       message: 'Set Whop API key and Company ID in Settings',
     });
   }
-  const currency = String(req.query.currency || 'usd').toLowerCase();
+  const currencyParam = req.query.currency != null ? String(req.query.currency).trim() : '';
   try {
-    const data = await getCompanyTransferableBalance(whop, companyId, currency);
-    return res.json(data);
+    if (currencyParam) {
+      const data = await getCompanyTransferableBalance(whop, companyId, currencyParam.toLowerCase());
+      return res.json(data);
+    }
+    const balances = await getCompanyLedgerBalances(whop, companyId);
+    return res.json({ balances });
   } catch (err) {
     const { status, message } = normalizeWhopError(err, 'Failed to fetch balance');
     const hint =

@@ -137,6 +137,14 @@ export type LedgerBalance = {
   transferable: number;
 };
 
+export type LedgerBalancesResponse = {
+  balances: LedgerBalance[];
+};
+
+export async function getBalances(): Promise<LedgerBalancesResponse> {
+  return request<LedgerBalancesResponse>('/api/balance');
+}
+
 export async function getBalance(currency = 'usd'): Promise<LedgerBalance> {
   const params = new URLSearchParams({ currency: currency.toLowerCase() });
   return request<LedgerBalance>(`/api/balance?${params}`);

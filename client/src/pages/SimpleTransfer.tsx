@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { Icon, IconPaths } from '../components/Icon';
-import { getSettings, createTransfer, getTransfers, getBalance, type Transfer } from '../api';
+import { getSettings, createTransfer, getTransfers, getBalance, getBalances, type Transfer, type LedgerBalance } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 import {
@@ -19,6 +19,17 @@ import {
 const initialSimple = loadSimpleTransferDraft();
 const initialBulk = loadBulkTransferDraft();
 
+const CURRENCY_OPTIONS = [
+  { value: 'usd', label: 'USD — US Dollar' },
+  { value: 'eur', label: 'EUR — Euro' },
+  { value: 'gbp', label: 'GBP — British Pound' },
+  { value: 'sgd', label: 'SGD — Singapore Dollar' },
+];
+
+function currencyLabel(code: string) {
+  return CURRENCY_OPTIONS.find((c) => c.value === code)?.label ?? code.toUpperCase();
+}
+
 function formatDate(iso: string) {
   try {
     return new Date(iso).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
@@ -32,6 +43,26 @@ function formatCurrency(amount: number, currency: string) {
     style: 'currency',
     currency: (currency || 'usd').toUpperCase(),
   }).format(amount);
+}
+
+function BalanceStatCard({
+  label,
+  value,
+  sub,
+  color,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  color: string;
+}) {
+  return (
+    <div className="card analytics-stat-card" style={{ padding: 18, textAlign: 'center' }}>
+      <div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div>
+      <div style={{ fontSize: 13, color: 'var(--text-2)', marginTop: 4 }}>{label}</div>
+      {sub && <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 6 }}>{sub}</div>}
+    </div>
+  );
 }
 
 function BalanceFillButton({
@@ -98,6 +129,10 @@ export default function SimpleTransfer() {
   const [bulkMsg, setBulkMsg] = useState<{ text: string; error: boolean } | null>(null);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [loadingTransfers, setLoadingTransfers] = useState(true);
+  const [ledgerBalances, setLedgerBalances] = useState<LedgerBalance[]>([]);
+  const [loadingBalances, setLoadingBalances] = useState(false);
+  const [balanceError, setBalanceError] = useState<string | null>(null);
+  const [overviewCurrency, setOverviewCurrency] = useState(initialSimple.currency || 'usd');
   const { showToast } = useToast();
 
   const feePct = getEffectiveFeePct(cachedFeePct);
@@ -124,6 +159,34 @@ export default function SimpleTransfer() {
       .finally(() => setLoadingTransfers(false));
   };
 
+  const loadBalances = () => {
+    if (!companyId) {
+      setLedgerBalances([]);
+      setBalanceError(null);
+      return;
+    }
+    setLoadingBalances(true);
+    setBalanceError(null);
+    getBalances()
+      .then((res) => {
+        const rows = res.balances || [];
+        setLedgerBalances(rows);
+        if (rows.length > 0 && !rows.some((b) => b.currency === overviewCurrency)) {
+          setOverviewCurrency(rows[0].currency);
+        }
+      })
+      .catch((err) => {
+        setLedgerBalances([]);
+        setBalanceError(err instanceof Error ? err.message : 'Could not load balance');
+      })
+      .finally(() => setLoadingBalances(false));
+  };
+
+  const refreshPageData = () => {
+    loadTransfers();
+    loadBalances();
+  };
+
   useEffect(() => {
     loadSettings();
   }, []);
@@ -131,6 +194,29 @@ export default function SimpleTransfer() {
   useEffect(() => {
     loadTransfers();
   }, []);
+
+  useEffect(() => {
+    loadBalances();
+  }, [companyId]);
+
+  const overviewBalanceOptions = useMemo(() => {
+    const fromApi = ledgerBalances.map((b) => b.currency);
+    const merged = new Set([...fromApi, ...CURRENCY_OPTIONS.map((c) => c.value)]);
+    return Array.from(merged).sort();
+  }, [ledgerBalances]);
+
+  const selectedOverviewBalance = useMemo(() => {
+    const found = ledgerBalances.find((b) => b.currency === overviewCurrency);
+    return (
+      found ?? {
+        currency: overviewCurrency,
+        balance: 0,
+        pending_balance: 0,
+        reserve_balance: 0,
+        transferable: 0,
+      }
+    );
+  }, [ledgerBalances, overviewCurrency]);
 
   useEffect(() => {
     saveSimpleTransferDraft({ destinationId, amount, currency, notes });
@@ -183,6 +269,7 @@ export default function SimpleTransfer() {
         });
         showToast(text);
         loadTransfers();
+        loadBalances();
       })
       .catch((err) => {
         const text = err instanceof Error ? err.message : 'Transfer failed';
@@ -317,6 +404,7 @@ export default function SimpleTransfer() {
     }
 
     loadTransfers();
+    loadBalances();
   };
 
   return (
@@ -329,15 +417,87 @@ export default function SimpleTransfer() {
         <button
           type="button"
           className="btn btn-ghost btn-sm"
-          onClick={loadTransfers}
-          disabled={loadingTransfers}
+          onClick={refreshPageData}
+          disabled={loadingTransfers || loadingBalances}
           style={{ gap: 6 }}
         >
           <Icon d={IconPaths.refresh} size={12} />
-          {loadingTransfers ? 'Loading…' : 'Refresh'}
+          {loadingTransfers || loadingBalances ? 'Loading…' : 'Refresh'}
         </button>
       </div>
       <div className="content">
+        <div className="card">
+          <div className="card-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Icon d={IconPaths.dollar} size={14} />
+              <span className="card-title">Account balance</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <select
+                className="select-native"
+                value={overviewCurrency}
+                onChange={(e) => setOverviewCurrency(e.target.value)}
+                disabled={!companyId || loadingBalances}
+                aria-label="Balance currency"
+                style={{ minWidth: 160 }}
+              >
+                {overviewBalanceOptions.map((code) => (
+                  <option key={code} value={code}>
+                    {currencyLabel(code)}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={loadBalances}
+                disabled={!companyId || loadingBalances}
+                style={{ gap: 6 }}
+              >
+                <Icon d={IconPaths.refresh} size={12} />
+                {loadingBalances ? 'Loading…' : 'Refresh'}
+              </button>
+            </div>
+          </div>
+          <div className="card-body" style={{ paddingTop: 16 }}>
+            {!companyId ? (
+              <div className="alert alert-error">
+                Set your Whop API key and Company ID in Settings to view your ledger balance.
+              </div>
+            ) : balanceError ? (
+              <div className="alert alert-error">{balanceError}</div>
+            ) : loadingBalances && ledgerBalances.length === 0 ? (
+              <div className="empty-state" style={{ padding: '24px 0' }}>
+                <p>Loading balance…</p>
+              </div>
+            ) : (
+              <div className="balance-stat-grid">
+                <BalanceStatCard
+                  label="Available balance"
+                  value={formatCurrency(selectedOverviewBalance.balance, overviewCurrency)}
+                  color="var(--green)"
+                />
+                <BalanceStatCard
+                  label="Pending amount"
+                  value={formatCurrency(selectedOverviewBalance.pending_balance, overviewCurrency)}
+                  color="rgba(234, 179, 8, 0.95)"
+                />
+                <BalanceStatCard
+                  label="Held / reserved"
+                  value={formatCurrency(selectedOverviewBalance.reserve_balance, overviewCurrency)}
+                  color="var(--text)"
+                />
+                <BalanceStatCard
+                  label="Transferable"
+                  value={formatCurrency(selectedOverviewBalance.transferable, overviewCurrency)}
+                  sub="Available minus reserve"
+                  color="var(--accent)"
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
         <div className="card">
           <div className="card-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
