@@ -23,6 +23,12 @@ import {
   WorkflowsPanel,
   UsersDetailPanel,
 } from '../components/admin/AnalyticsPanels';
+import {
+  ANALYTICS_PERIOD_OPTIONS,
+  DEFAULT_ANALYTICS_PERIOD,
+  formatChartDateLabel,
+  type AnalyticsPeriod,
+} from '../lib/analyticsPeriod';
 
 type AnalyticsTab = 'overview' | 'queues' | 'workflows' | 'users';
 
@@ -52,21 +58,12 @@ const CHART_COLORS = [
 const TICK_COLOR = '#b4b4be';
 const GRID_COLOR = 'rgba(255, 255, 255, 0.06)';
 
-function formatShortDate(isoDate: string) {
-  try {
-    const d = new Date(isoDate);
-    return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-  } catch {
-    return isoDate;
-  }
-}
-
 export default function Analytics() {
   const navigate = useNavigate();
   const [allowed, setAllowed] = useState<boolean | null>(null);
   const [data, setData] = useState<AdminAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
-  const [days, setDays] = useState(30);
+  const [period, setPeriod] = useState<AnalyticsPeriod>(DEFAULT_ANALYTICS_PERIOD);
   const [tab, setTab] = useState<AnalyticsTab>('overview');
 
   useEffect(() => {
@@ -88,11 +85,14 @@ export default function Analytics() {
   useEffect(() => {
     if (!allowed) return;
     setLoading(true);
-    getAdminAnalytics(days)
+    getAdminAnalytics(period)
       .then(setData)
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [allowed, days]);
+  }, [allowed, period]);
+
+  const useHourly = data?.useHourly ?? false;
+  const formatShortDate = (isoDate: string) => formatChartDateLabel(isoDate, useHourly);
 
   // Derive chart data from `data` (safe when null – empty arrays)
   const signupsLabels = data?.signupsByDay?.map((d) => d.date) || [];
@@ -160,7 +160,7 @@ export default function Analytics() {
         },
       },
     }),
-    []
+    [useHourly]
   );
 
   const signupsChartData = useMemo(
@@ -297,13 +297,15 @@ export default function Analytics() {
         </div>
         <div className="topbar-actions">
           <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+            value={period}
+            onChange={(e) => setPeriod(e.target.value as AnalyticsPeriod)}
             className="select-native"
           >
-            <option value={7}>Last 7 days</option>
-            <option value={30}>Last 30 days</option>
-            <option value={90}>Last 90 days</option>
+            {ANALYTICS_PERIOD_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
           </select>
         </div>
       </div>

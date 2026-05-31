@@ -1443,9 +1443,9 @@ api.get('/admin/queue', requireAuth, requireAdmin, async (req, res) => {
 
 api.get('/analytics', requireAuth, async (req, res) => {
   const userId = getUserId(req);
-  const days = Math.min(Number(req.query.days) || 30, 90);
+  const period = req.query.period || req.query.days || '30d';
   try {
-    const stats = await db.getUserInsights(userId, days);
+    const stats = await db.getUserInsights(userId, period);
     return res.json(stats);
   } catch (err) {
     console.error('User analytics error:', err);
@@ -1454,9 +1454,9 @@ api.get('/analytics', requireAuth, async (req, res) => {
 });
 
 api.get('/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
-  const days = Math.min(Number(req.query.days) || 30, 90);
+  const period = req.query.period || req.query.days || '30d';
   try {
-    const stats = await db.getAdminInsights(days);
+    const stats = await db.getAdminInsights(period);
     stats.worker = getWorkerConfig();
     stats.workerStatus = getWorkerStatus();
     return res.json(stats);

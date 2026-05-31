@@ -6,6 +6,13 @@
 import mysql from 'mysql2/promise';
 import crypto from 'crypto';
 import { decrypt, encrypt } from './lib/crypto.js';
+import {
+  parseAnalyticsPeriod,
+  sqlTimeFilter,
+  sqlTimeFilterNow,
+  sqlDateGroup,
+  rangeQueryParams,
+} from './lib/analyticsRange.js';
 
 const DB_NAME = process.env.DB_NAME || 'whop_admin';
 let pool = null;
@@ -158,20 +165,30 @@ export async function getActivityLogs(limit = 200, offset = 0, filters = {}) {
   }));
 }
 
-/** Analytics: users count, signups by day, activity by action, app-wide stats (last N days). */
-export async function getAnalyticsStats(days = 30) {
+function analyticsBucketKey(dateVal, useHourly) {
+  const s = String(dateVal);
+  return useHourly ? s.slice(0, 16) : s.slice(0, 10);
+}
+
+/** Analytics: users count, signups by day, activity by action, app-wide stats. */
+export async function getAnalyticsStats(periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
+  const dg = sqlDateGroup(range);
+  const params = range.timeParams;
+
   const [usersCount] = await query('SELECT COUNT(*) AS total FROM users');
   const signupsByDay = await query(
-    `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM users WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) GROUP BY DATE(created_at) ORDER BY date ASC`,
-    [days]
+    `SELECT ${dg} AS date, COUNT(*) AS count FROM users WHERE ${tw} GROUP BY ${dg} ORDER BY date ASC`,
+    params
   );
   const activityByAction = await query(
-    `SELECT action, COUNT(*) AS count FROM activity_log WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) GROUP BY action ORDER BY count DESC`,
-    [days]
+    `SELECT action, COUNT(*) AS count FROM activity_log WHERE ${tw} GROUP BY action ORDER BY count DESC`,
+    params
   );
   const loginsByDay = await query(
-    `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM activity_log WHERE action = 'login' AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) GROUP BY DATE(created_at) ORDER BY date ASC`,
-    [days]
+    `SELECT ${dg} AS date, COUNT(*) AS count FROM activity_log WHERE action = 'login' AND ${tw} GROUP BY ${dg} ORDER BY date ASC`,
+    params
   );
   let connectedAccountsTotal = 0;
   let autoSplitRulesTotal = 0;
@@ -192,16 +209,19 @@ export async function getAnalyticsStats(days = 30) {
   } catch (_) {}
   try {
     const [tc] = await query(
-      `SELECT COUNT(*) AS total FROM activity_log WHERE action = 'transfer_create' AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
-      [days]
+      `SELECT COUNT(*) AS total FROM activity_log WHERE action = 'transfer_create' AND ${tw}`,
+      params
     );
     transferCreatesInPeriod = tc?.total ?? 0;
     transferCreatesByDay = await query(
-      `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM activity_log WHERE action = 'transfer_create' AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) GROUP BY DATE(created_at) ORDER BY date ASC`,
-      [days]
+      `SELECT ${dg} AS date, COUNT(*) AS count FROM activity_log WHERE action = 'transfer_create' AND ${tw} GROUP BY ${dg} ORDER BY date ASC`,
+      params
     );
   } catch (_) {}
   return {
+    period: range.period,
+    useHourly: range.useHourly,
+    days: range.displayDays,
     usersTotal: usersCount?.total ?? 0,
     signupsByDay: signupsByDay || [],
     activityByAction: activityByAction || [],
@@ -1156,18 +1176,21 @@ export async function getPaymentJobsByUser() {
   });
 }
 
-export async function getPaymentJobsByDay(days = 30) {
+export async function getPaymentJobsByDay(periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
+  const dg = sqlDateGroup(range);
   const rows = await query(
-    `SELECT DATE(created_at) AS date, status, COUNT(*) AS count
+    `SELECT ${dg} AS date, status, COUNT(*) AS count
      FROM payment_jobs
-     WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-     GROUP BY DATE(created_at), status
+     WHERE ${tw}
+     GROUP BY ${dg}, status
      ORDER BY date ASC`,
-    [days]
+    range.timeParams
   );
   const byDate = new Map();
   for (const r of rows) {
-    const d = String(r.date).slice(0, 10);
+    const d = analyticsBucketKey(r.date, range.useHourly);
     if (!byDate.has(d)) {
       byDate.set(d, { date: d, pending: 0, processing: 0, completed: 0, failed: 0 });
     }
@@ -1205,12 +1228,14 @@ function parseMeta(meta) {
   }
 }
 
-export async function getWorkflowMetrics(days = 30) {
+export async function getWorkflowMetrics(periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilterNow(range);
   const rows = await query(
     `SELECT user_id, email, action, meta FROM activity_log
      WHERE action IN ('webhook_split', 'webhook_auto_transfer', 'webhook_split_error', 'webhook_enqueue')
-       AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
-    [days]
+       AND ${tw}`,
+    range.timeParams
   );
 
   const global = {
@@ -1308,19 +1333,22 @@ export async function getWorkflowMetrics(days = 30) {
   };
 }
 
-export async function getWorkflowEventsByDay(days = 30) {
+export async function getWorkflowEventsByDay(periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
+  const dg = sqlDateGroup(range);
   const rows = await query(
-    `SELECT DATE(created_at) AS date, action, COUNT(*) AS count
+    `SELECT ${dg} AS date, action, COUNT(*) AS count
      FROM activity_log
      WHERE action IN ('webhook_split', 'webhook_auto_transfer')
-       AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-     GROUP BY DATE(created_at), action
+       AND ${tw}
+     GROUP BY ${dg}, action
      ORDER BY date ASC`,
-    [days]
+    range.timeParams
   );
   const byDate = new Map();
   for (const r of rows) {
-    const d = String(r.date).slice(0, 10);
+    const d = analyticsBucketKey(r.date, range.useHourly);
     if (!byDate.has(d)) {
       byDate.set(d, { date: d, split: 0, transfer: 0 });
     }
@@ -1331,18 +1359,21 @@ export async function getWorkflowEventsByDay(days = 30) {
   return Array.from(byDate.values());
 }
 
-export async function getUserPaymentJobsByDay(userId, days = 30) {
+export async function getUserPaymentJobsByDay(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
+  const dg = sqlDateGroup(range);
   const rows = await query(
-    `SELECT DATE(created_at) AS date, status, COUNT(*) AS count
+    `SELECT ${dg} AS date, status, COUNT(*) AS count
      FROM payment_jobs
-     WHERE user_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-     GROUP BY DATE(created_at), status
+     WHERE user_id = ? AND ${tw}
+     GROUP BY ${dg}, status
      ORDER BY date ASC`,
-    [userId, days]
+    rangeQueryParams(range, userId)
   );
   const byDate = new Map();
   for (const r of rows) {
-    const d = String(r.date).slice(0, 10);
+    const d = analyticsBucketKey(r.date, range.useHourly);
     if (!byDate.has(d)) {
       byDate.set(d, { date: d, pending: 0, processing: 0, completed: 0, failed: 0 });
     }
@@ -1351,32 +1382,39 @@ export async function getUserPaymentJobsByDay(userId, days = 30) {
   return Array.from(byDate.values());
 }
 
-export async function getUserActivityByAction(userId, days = 30) {
+export async function getUserActivityByAction(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
   return query(
     `SELECT action, COUNT(*) AS count FROM activity_log
-     WHERE user_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     WHERE user_id = ? AND ${tw}
      GROUP BY action ORDER BY count DESC`,
-    [userId, days]
+    rangeQueryParams(range, userId)
   );
 }
 
-export async function getUserTransferCreatesByDay(userId, days = 30) {
+export async function getUserTransferCreatesByDay(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
+  const dg = sqlDateGroup(range);
   return query(
-    `SELECT DATE(created_at) AS date, COUNT(*) AS count FROM activity_log
+    `SELECT ${dg} AS date, COUNT(*) AS count FROM activity_log
      WHERE user_id = ? AND action = 'transfer_create'
-       AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-     GROUP BY DATE(created_at) ORDER BY date ASC`,
-    [userId, days]
+       AND ${tw}
+     GROUP BY ${dg} ORDER BY date ASC`,
+    rangeQueryParams(range, userId)
   );
 }
 
-export async function getUserWorkflowMetrics(userId, days = 30) {
+export async function getUserWorkflowMetrics(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilterNow(range);
   const rows = await query(
     `SELECT action, meta FROM activity_log
      WHERE user_id = ?
        AND action IN ('webhook_split', 'webhook_auto_transfer', 'webhook_enqueue', 'payment_poll')
-       AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
-    [userId, days]
+       AND ${tw}`,
+    rangeQueryParams(range, userId)
   );
 
   const global = {
@@ -1421,20 +1459,23 @@ export async function getUserWorkflowMetrics(userId, days = 30) {
   };
 }
 
-export async function getUserWorkflowEventsByDay(userId, days = 30) {
+export async function getUserWorkflowEventsByDay(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
+  const dg = sqlDateGroup(range);
   const rows = await query(
-    `SELECT DATE(created_at) AS date, action, COUNT(*) AS count
+    `SELECT ${dg} AS date, action, COUNT(*) AS count
      FROM activity_log
      WHERE user_id = ?
        AND action IN ('webhook_split', 'webhook_auto_transfer')
-       AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-     GROUP BY DATE(created_at), action
+       AND ${tw}
+     GROUP BY ${dg}, action
      ORDER BY date ASC`,
-    [userId, days]
+    rangeQueryParams(range, userId)
   );
   const byDate = new Map();
   for (const r of rows) {
-    const d = String(r.date).slice(0, 10);
+    const d = analyticsBucketKey(r.date, range.useHourly);
     if (!byDate.has(d)) {
       byDate.set(d, { date: d, split: 0, transfer: 0 });
     }
@@ -1445,7 +1486,9 @@ export async function getUserWorkflowEventsByDay(userId, days = 30) {
   return Array.from(byDate.values());
 }
 
-export async function getUserAppStats(userId, days = 30) {
+export async function getUserAppStats(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const tw = sqlTimeFilter(range);
   let connectedAccountsTotal = 0;
   let autoSplitRulesTotal = 0;
   let autoTransferRulesTotal = 0;
@@ -1480,8 +1523,8 @@ export async function getUserAppStats(userId, days = 30) {
     const [tc] = await query(
       `SELECT COUNT(*) AS total FROM activity_log
        WHERE user_id = ? AND action = 'transfer_create'
-         AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
-      [userId, days]
+         AND ${tw}`,
+      rangeQueryParams(range, userId)
     );
     transferCreatesInPeriod = tc?.total ?? 0;
   } catch (_) {}
@@ -1510,20 +1553,22 @@ export async function getUserAppStats(userId, days = 30) {
   };
 }
 
-export async function getUserInsights(userId, days = 30) {
-  const d = Math.max(1, Math.min(Number(days) || 30, 90));
+export async function getUserInsights(userId, periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
 
-  const activityByAction = (await getUserActivityByAction(userId, d)).map((r) => ({
+  const activityByAction = (await getUserActivityByAction(userId, range.period)).map((r) => ({
     action: r.action,
     count: Number(r.count) || 0,
   }));
 
-  const transferCreatesByDay = (await getUserTransferCreatesByDay(userId, d)).map((r) => ({
-    date: String(r.date).slice(0, 10),
-    count: Number(r.count) || 0,
-  }));
+  const transferCreatesByDay = (await getUserTransferCreatesByDay(userId, range.period)).map(
+    (r) => ({
+      date: analyticsBucketKey(r.date, range.useHourly),
+      count: Number(r.count) || 0,
+    })
+  );
 
-  const appStats = await getUserAppStats(userId, d);
+  const appStats = await getUserAppStats(userId, range.period);
 
   let queue = {
     global: { pending: 0, processing: 0, completed: 0, failed: 0 },
@@ -1533,7 +1578,7 @@ export async function getUserInsights(userId, days = 30) {
   };
   try {
     queue.global = await getUserPaymentJobStats(userId);
-    queue.byDay = await getUserPaymentJobsByDay(userId, d);
+    queue.byDay = await getUserPaymentJobsByDay(userId, range.period);
     const [failRow] = await query(
       `SELECT COUNT(*) AS count FROM payment_jobs
        WHERE user_id = ? AND status = 'failed'
@@ -1546,25 +1591,43 @@ export async function getUserInsights(userId, days = 30) {
     queue.error = e?.message || 'payment_jobs unavailable';
   }
 
-  const finished = (queue.global.completed || 0) + (queue.global.failed || 0);
+  const hasWorkflows =
+    appStats.autoSplitEnabled ||
+    appStats.autoTransferEnabled ||
+    appStats.autoSplitRulesTotal > 0 ||
+    appStats.autoTransferRulesTotal > 0;
+
+  const periodCompleted = queue.byDay.reduce((sum, row) => sum + (row.completed || 0), 0);
+  const periodFailed = queue.byDay.reduce((sum, row) => sum + (row.failed || 0), 0);
+  const periodFinished = periodCompleted + periodFailed;
   const jobCompletionRate =
-    finished > 0 ? Math.round(((queue.global.completed || 0) / finished) * 1000) / 10 : null;
+    hasWorkflows && periodFinished > 0
+      ? Math.round((periodCompleted / periodFinished) * 1000) / 10
+      : null;
 
   let workflows = { global: {}, byDay: [] };
   try {
-    workflows = await getUserWorkflowMetrics(userId, d);
-    workflows.byDay = await getUserWorkflowEventsByDay(userId, d);
+    workflows = await getUserWorkflowMetrics(userId, range.period);
+    workflows.byDay = await getUserWorkflowEventsByDay(userId, range.period);
   } catch (_) {}
 
   const recentActivity = await getActivityLogs(40, 0, { userId });
   const settings = await getUserSettings(userId);
 
   return {
-    days: d,
+    period: range.period,
+    useHourly: range.useHourly,
+    days: range.displayDays,
     activityByAction,
     transferCreatesByDay,
     appStats,
-    queue: { ...queue, jobCompletionRate },
+    queue: {
+      ...queue,
+      jobCompletionRate,
+      periodCompleted,
+      periodFailed,
+      hasWorkflows,
+    },
     workflows,
     recentActivity,
     pollsTotal: settings?.polls_total ?? 0,
@@ -1575,8 +1638,9 @@ export async function getUserInsights(userId, days = 30) {
 }
 
 /** Extended admin analytics: base stats + queue + workflow metrics. */
-export async function getAdminInsights(days = 30) {
-  const base = await getAnalyticsStats(days);
+export async function getAdminInsights(periodInput = '30d') {
+  const range = parseAnalyticsPeriod(periodInput);
+  const base = await getAnalyticsStats(range.period);
   let queue = {
     global: { pending: 0, processing: 0, completed: 0, failed: 0 },
     byUser: [],
@@ -1588,7 +1652,7 @@ export async function getAdminInsights(days = 30) {
   try {
     queue.global = await getPaymentJobQueueStats();
     queue.byUser = await getPaymentJobsByUser();
-    queue.byDay = await getPaymentJobsByDay(days);
+    queue.byDay = await getPaymentJobsByDay(range.period);
     queue.oldestPendingSeconds = await getOldestPendingJobAgeSeconds();
     queue.failedLast24h = await getPaymentJobsFailedSinceHours(24);
   } catch (e) {
@@ -1612,8 +1676,8 @@ export async function getAdminInsights(days = 30) {
     byDay: [],
   };
   try {
-    workflows = await getWorkflowMetrics(days);
-    workflows.byDay = await getWorkflowEventsByDay(days);
+    workflows = await getWorkflowMetrics(range.period);
+    workflows.byDay = await getWorkflowEventsByDay(range.period);
   } catch (_) {}
 
   const finished =

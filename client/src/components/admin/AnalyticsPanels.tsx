@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { Bar, Doughnut, Line } from 'react-chartjs-2';
 import type { AdminAnalytics, QueueUserStats, WorkflowUserMetrics } from '../../api';
+import { formatChartDateLabel } from '../../lib/analyticsPeriod';
 
 const CHART_COLORS = [
   'rgba(250, 70, 22, 0.85)',
@@ -39,14 +40,6 @@ const barOptionsBase = {
     },
   },
 };
-
-function formatShortDate(isoDate: string) {
-  try {
-    return new Date(isoDate).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-  } catch {
-    return isoDate;
-  }
-}
 
 function pct(v: number | null | undefined) {
   if (v == null) return '—';
@@ -97,6 +90,7 @@ export function WorkflowKpis({ data }: { data: AdminAnalytics }) {
 
 export function QueuePanel({ data }: { data: AdminAnalytics }) {
   const q = data.queue;
+  const useHourly = data.useHourly ?? false;
   const byDay = q?.byDay || [];
   const labels = byDay.map((d) => d.date);
 
@@ -175,7 +169,8 @@ export function QueuePanel({ data }: { data: AdminAnalytics }) {
                     stacked: true,
                     ticks: {
                       ...barOptionsBase.scales.x.ticks,
-                      callback: (v) => (typeof v === 'string' ? formatShortDate(v) : v),
+                      callback: (v) =>
+                        typeof v === 'string' ? formatChartDateLabel(v, useHourly) : v,
                     },
                   },
                   y: { ...barOptionsBase.scales.y, stacked: true },

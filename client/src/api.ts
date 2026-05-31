@@ -499,6 +499,9 @@ export type WorkflowUserMetrics = {
 };
 
 export type AdminAnalytics = {
+  period?: string;
+  useHourly?: boolean;
+  days?: number | null;
   usersTotal: number;
   signupsByDay: Array<{ date: string; count: number }>;
   activityByAction: Array<{ action: string; count: number }>;
@@ -569,13 +572,15 @@ export type SystemHealth = {
   failedJobs24h: number;
 };
 
-export async function getAdminAnalytics(days?: number): Promise<AdminAnalytics> {
-  const params = days != null ? `?days=${days}` : '';
+export async function getAdminAnalytics(period?: string): Promise<AdminAnalytics> {
+  const params = period != null ? `?period=${encodeURIComponent(period)}` : '';
   return request<AdminAnalytics>(`/api/admin/analytics${params}`);
 }
 
 export type UserAnalytics = {
-  days: number;
+  period?: string;
+  useHourly?: boolean;
+  days?: number | null;
   activityByAction: Array<{ action: string; count: number }>;
   transferCreatesByDay: Array<{ date: string; count: number }>;
   appStats: {
@@ -593,6 +598,9 @@ export type UserAnalytics = {
     byDay: Array<{ date: string; pending: number; processing: number; completed: number; failed: number }>;
     failedLast24h: number;
     jobCompletionRate: number | null;
+    periodCompleted?: number;
+    periodFailed?: number;
+    hasWorkflows?: boolean;
     tableAvailable?: boolean;
     error?: string;
   };
@@ -624,8 +632,8 @@ export type UserAnalytics = {
   pollEnabled: boolean;
 };
 
-export async function getUserAnalytics(days?: number): Promise<UserAnalytics> {
-  const params = days != null ? `?days=${days}` : '';
+export async function getUserAnalytics(period?: string): Promise<UserAnalytics> {
+  const params = period != null ? `?period=${encodeURIComponent(period)}` : '';
   return request<UserAnalytics>(`/api/analytics${params}`);
 }
 

@@ -16,6 +16,12 @@ import { Bar, Line, Doughnut } from 'react-chartjs-2';
 import { Icon, IconPaths } from '../components/Icon';
 import { getUserAnalytics } from '../api';
 import type { UserAnalytics } from '../api';
+import {
+  ANALYTICS_PERIOD_OPTIONS,
+  DEFAULT_ANALYTICS_PERIOD,
+  formatChartDateLabel,
+  type AnalyticsPeriod,
+} from '../lib/analyticsPeriod';
 
 type Tab = 'overview' | 'workflows';
 
@@ -58,14 +64,6 @@ const ACTION_LABELS: Record<string, string> = {
   settings_update: 'Settings saved',
   login: 'Login',
 };
-
-function formatShortDate(isoDate: string) {
-  try {
-    return new Date(isoDate).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-  } catch {
-    return isoDate;
-  }
-}
 
 function pct(v: number | null | undefined) {
   if (v == null) return '—';
@@ -121,16 +119,19 @@ function StatCard({
 export default function UserAnalytics() {
   const [data, setData] = useState<UserAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
-  const [days, setDays] = useState(30);
+  const [period, setPeriod] = useState<AnalyticsPeriod>(DEFAULT_ANALYTICS_PERIOD);
   const [tab, setTab] = useState<Tab>('overview');
 
   useEffect(() => {
     setLoading(true);
-    getUserAnalytics(days)
+    getUserAnalytics(period)
       .then(setData)
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [days]);
+  }, [period]);
+
+  const useHourly = data?.useHourly ?? false;
+  const formatShortDate = (isoDate: string) => formatChartDateLabel(isoDate, useHourly);
 
   const wf = data?.workflows?.global;
   const app = data?.appStats;
@@ -220,6 +221,16 @@ export default function UserAnalytics() {
   }, [wf]);
 
   const queueByDay = data?.queue?.byDay || [];
+  const hasWorkflows = queue?.hasWorkflows ?? false;
+  const periodCompleted = queue?.periodCompleted ?? 0;
+  const periodFailed = queue?.periodFailed ?? 0;
+  const periodFinished = periodCompleted + periodFailed;
+  const jobCompletionSub = !hasWorkflows
+    ? 'Enable auto-split or auto-transfer'
+    : periodFinished > 0
+      ? `${periodCompleted} ok · ${periodFailed} failed`
+      : 'No finished jobs in period';
+
   const queueStacked = useMemo(
     () => ({
       labels: queueByDay.map((d) => formatShortDate(d.date)),
@@ -243,13 +254,15 @@ export default function UserAnalytics() {
         </div>
         <div className="topbar-actions">
           <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+            value={period}
+            onChange={(e) => setPeriod(e.target.value as AnalyticsPeriod)}
             className="select-native"
           >
-            <option value={7}>Last 7 days</option>
-            <option value={30}>Last 30 days</option>
-            <option value={90}>Last 90 days</option>
+            {ANALYTICS_PERIOD_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
           </select>
         </div>
       </div>
@@ -346,7 +359,12 @@ export default function UserAnalytics() {
                 marginBottom: 24,
               }}
             >
-              <StatCard label="Job completion rate" value={pct(queue?.jobCompletionRate)} color="var(--green)" />
+              <StatCard
+                label="Job completion rate"
+                value={pct(queue?.jobCompletionRate)}
+                sub={jobCompletionSub}
+                color="var(--green)"
+              />
               <StatCard label="Manual transfers" value={app?.transferCreatesInPeriod ?? 0} color="var(--green)" />
               <StatCard label="Connected accounts" value={app?.connectedAccountsTotal ?? 0} color="rgba(6, 182, 212, 0.95)" />
               <StatCard label="Auto-split rules" value={app?.autoSplitRulesTotal ?? 0} sub={app?.autoSplitEnabled ? 'Enabled' : 'Off'} color="rgba(168, 85, 247, 0.95)" />
@@ -368,7 +386,7 @@ export default function UserAnalytics() {
                   <Bar options={barOptions} data={transferChart} />
                 </div>
               </div>
-              {queueByDay.length > 0 && (
+              {hasWorkflows && queueByDay.length > 0 && (
                 <div className="card">
                   <div className="card-header">
                     <span className="card-title">Payment jobs by day</span>
@@ -392,7 +410,7 @@ export default function UserAnalytics() {
                 <div className="card-header">
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <Icon d={IconPaths.chart} size={14} />
-                    <span className="card-title">Your actions (period)</span>
+                    <span className="card-title">Background activity (period)</span>
                   </div>
                 </div>
                 <div className="card-body" style={{ paddingTop: 8 }}>
