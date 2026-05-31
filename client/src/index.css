@@ -131,6 +131,39 @@ body {
 }
 .field-input:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.amount-input-wrap {
+  position: relative;
+  display: block;
+}
+.amount-input-wrap .field-input {
+  padding-right: 40px;
+}
+.amount-input-wrap .amount-fill-btn {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  padding: 5px;
+  cursor: pointer;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.amount-input-wrap .amount-fill-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+}
+.amount-input-wrap .amount-fill-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .password-input-wrap {
   position: relative;
   display: block;

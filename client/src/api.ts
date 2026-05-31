@@ -129,6 +129,19 @@ export async function updateCompany(id: string, body: { title?: string; descript
   });
 }
 
+export type LedgerBalance = {
+  currency: string;
+  balance: number;
+  pending_balance: number;
+  reserve_balance: number;
+  transferable: number;
+};
+
+export async function getBalance(currency = 'usd'): Promise<LedgerBalance> {
+  const params = new URLSearchParams({ currency: currency.toLowerCase() });
+  return request<LedgerBalance>(`/api/balance?${params}`);
+}
+
 export async function getTransfers(): Promise<{ data: Transfer[]; error?: string; message?: string }> {
   const res = await fetch(BASE + '/api/transfers', { credentials: 'include' });
   const data = await res.json().catch(() => ({}));

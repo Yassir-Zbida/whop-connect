@@ -140,6 +140,34 @@ function normalizeWhopError(err, fallbackMessage) {
   return { status: 500, message: raw };
 }
 
+/** Transferable ledger balance for a company in a given currency (balance minus reserve). */
+async function getCompanyTransferableBalance(whop, companyId, currency = 'usd') {
+  const ledger = await whop.ledgerAccounts.retrieve(companyId);
+  const balances = Array.isArray(ledger?.balances) ? ledger.balances : [];
+  const cur = String(currency || 'usd').toLowerCase();
+  const entry = balances.find((b) => String(b.currency || '').toLowerCase() === cur);
+  if (!entry) {
+    return {
+      currency: cur,
+      balance: 0,
+      pending_balance: 0,
+      reserve_balance: 0,
+      transferable: 0,
+    };
+  }
+  const balance = Number(entry.balance) || 0;
+  const pending = Number(entry.pending_balance) || 0;
+  const reserve = Number(entry.reserve_balance) || 0;
+  const transferable = Math.max(0, balance - reserve);
+  return {
+    currency: cur,
+    balance,
+    pending_balance: pending,
+    reserve_balance: reserve,
+    transferable: Math.floor(transferable * 100) / 100,
+  };
+}
+
 /** Reserve status for a connected account (ledger + optional company field). */
 async function getConnectedAccountReserveInfo(whop, companyId) {
   if (!whop || !companyId) {
@@ -722,6 +750,34 @@ api.post('/transfers', requireAuth, async (req, res) => {
     return res.status(typeof status === 'number' ? status : 500).json({
       error: 'Whop API error',
       message,
+    });
+  }
+});
+
+// ——— Whop API: Ledger balance ———
+api.get('/balance', requireAuth, async (req, res) => {
+  const userId = getUserId(req);
+  const whop = await getWhop(userId);
+  const companyId = await getWhopCompanyId(userId);
+  if (!whop || !companyId) {
+    return res.status(503).json({
+      error: 'Whop API not configured',
+      message: 'Set Whop API key and Company ID in Settings',
+    });
+  }
+  const currency = String(req.query.currency || 'usd').toLowerCase();
+  try {
+    const data = await getCompanyTransferableBalance(whop, companyId, currency);
+    return res.json(data);
+  } catch (err) {
+    const { status, message } = normalizeWhopError(err, 'Failed to fetch balance');
+    const hint =
+      status === 502
+        ? message
+        : `${message} Your API key may need company:balance:read and payout:account:read permissions.`;
+    return res.status(status).json({
+      error: status === 502 ? 'Whop rejected request' : 'Whop API error',
+      message: hint,
     });
   }
 });

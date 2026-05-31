@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { Icon, IconPaths } from '../components/Icon';
-import { getSettings, createTransfer, getTransfers, type Transfer } from '../api';
+import { getSettings, createTransfer, getTransfers, getBalance, type Transfer } from '../api';
 import { useToast } from '../context/ToastContext';
 import { logSuccess, logError } from '../utils/logger';
 import {
@@ -9,6 +9,15 @@ import {
   getEffectiveFeePct,
   MIN_TRANSFER_USD,
 } from '../utils/transfer-fees';
+import {
+  loadBulkTransferDraft,
+  loadSimpleTransferDraft,
+  saveBulkTransferDraft,
+  saveSimpleTransferDraft,
+} from '../lib/transferFormDraft';
+
+const initialSimple = loadSimpleTransferDraft();
+const initialBulk = loadBulkTransferDraft();
 
 function formatDate(iso: string) {
   try {
@@ -25,21 +34,65 @@ function formatCurrency(amount: number, currency: string) {
   }).format(amount);
 }
 
+function BalanceFillButton({
+  currency,
+  disabled,
+  onFill,
+}: {
+  currency: string;
+  disabled?: boolean;
+  onFill: (amount: string) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const { showToast } = useToast();
+
+  const handleClick = () => {
+    setLoading(true);
+    getBalance(currency)
+      .then((res) => {
+        if (res.transferable <= 0) {
+          showToast(`No available ${currency.toUpperCase()} balance to transfer`, 'error');
+          return;
+        }
+        onFill(res.transferable.toFixed(2));
+        showToast(`Filled ${formatCurrency(res.transferable, currency)} available balance`);
+      })
+      .catch((err) => {
+        const text = err instanceof Error ? err.message : 'Could not fetch balance';
+        showToast(text, 'error');
+      })
+      .finally(() => setLoading(false));
+  };
+
+  return (
+    <button
+      type="button"
+      className="amount-fill-btn"
+      onClick={handleClick}
+      disabled={disabled || loading}
+      title="Use full available balance"
+      aria-label="Use full available balance"
+    >
+      <Icon d={IconPaths.dollar} size={14} />
+    </button>
+  );
+}
+
 export default function SimpleTransfer() {
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [platformCommissionPct, setPlatformCommissionPct] = useState(1);
   const [cachedFeePct, setCachedFeePct] = useState<number | null>(null);
-  const [destinationId, setDestinationId] = useState('');
-  const [amount, setAmount] = useState('');
-  const [currency, setCurrency] = useState('usd');
-  const [notes, setNotes] = useState('');
+  const [destinationId, setDestinationId] = useState(initialSimple.destinationId);
+  const [amount, setAmount] = useState(initialSimple.amount);
+  const [currency, setCurrency] = useState(initialSimple.currency);
+  const [notes, setNotes] = useState(initialSimple.notes);
   const [submitting, setSubmitting] = useState(false);
   const [msg, setMsg] = useState<{ text: string; error: boolean } | null>(null);
-  const [bulkDestinationId, setBulkDestinationId] = useState('');
-  const [bulkTotalAmount, setBulkTotalAmount] = useState('');
-  const [bulkPerAmount, setBulkPerAmount] = useState('');
-  const [bulkCurrency, setBulkCurrency] = useState('usd');
-  const [bulkNotes, setBulkNotes] = useState('');
+  const [bulkDestinationId, setBulkDestinationId] = useState(initialBulk.destinationId);
+  const [bulkTotalAmount, setBulkTotalAmount] = useState(initialBulk.totalAmount);
+  const [bulkPerAmount, setBulkPerAmount] = useState(initialBulk.perAmount);
+  const [bulkCurrency, setBulkCurrency] = useState(initialBulk.currency);
+  const [bulkNotes, setBulkNotes] = useState(initialBulk.notes);
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number } | null>(null);
   const [bulkMsg, setBulkMsg] = useState<{ text: string; error: boolean } | null>(null);
@@ -79,6 +132,20 @@ export default function SimpleTransfer() {
     loadTransfers();
   }, []);
 
+  useEffect(() => {
+    saveSimpleTransferDraft({ destinationId, amount, currency, notes });
+  }, [destinationId, amount, currency, notes]);
+
+  useEffect(() => {
+    saveBulkTransferDraft({
+      destinationId: bulkDestinationId,
+      totalAmount: bulkTotalAmount,
+      perAmount: bulkPerAmount,
+      currency: bulkCurrency,
+      notes: bulkNotes,
+    });
+  }, [bulkDestinationId, bulkTotalAmount, bulkPerAmount, bulkCurrency, bulkNotes]);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const destId = destinationId.trim();
@@ -115,8 +182,6 @@ export default function SimpleTransfer() {
           destination_id: destId,
         });
         showToast(text);
-        setAmount('');
-        setNotes('');
         loadTransfers();
       })
       .catch((err) => {
@@ -249,9 +314,6 @@ export default function SimpleTransfer() {
         destination_id: destId,
       });
       showToast(text);
-      setBulkTotalAmount('');
-      setBulkPerAmount('');
-      setBulkNotes('');
     }
 
     loadTransfers();
@@ -321,17 +383,20 @@ export default function SimpleTransfer() {
                 <div className="form-grid-3">
                   <div className="field">
                     <label className="field-label">Amount *</label>
-                    <input
-                      id="st-amount"
-                      type="number"
-                      className="field-input"
-                      placeholder="0.00"
-                      min="0.01"
-                      step="0.01"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      disabled={submitting}
-                    />
+                    <div className="amount-input-wrap">
+                      <input
+                        id="st-amount"
+                        type="number"
+                        className="field-input"
+                        placeholder="0.00"
+                        min="0.01"
+                        step="0.01"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        disabled={submitting}
+                      />
+                      <BalanceFillButton currency={currency} disabled={submitting} onFill={setAmount} />
+                    </div>
                   </div>
                   <div className="field">
                     <label className="field-label">Currency</label>
@@ -362,11 +427,6 @@ export default function SimpleTransfer() {
                     />
                   </div>
                 </div>
-                {msg && (
-                  <div className={`alert ${msg.error ? 'alert-error' : 'alert-success'}`}>
-                    {msg.text}
-                  </div>
-                )}
                 <button
                   type="submit"
                   className="btn btn-primary"
@@ -376,6 +436,14 @@ export default function SimpleTransfer() {
                   <Icon d={IconPaths.transfer} size={13} />
                   {submitting ? 'Sending…' : 'Create transfer'}
                 </button>
+                {msg && (
+                  <div
+                    className={`alert ${msg.error ? 'alert-error' : 'alert-success'}`}
+                    style={{ marginTop: 12 }}
+                  >
+                    {msg.text}
+                  </div>
+                )}
               </form>
             )}
           </div>
@@ -416,16 +484,23 @@ export default function SimpleTransfer() {
                 <div className="form-grid-3">
                   <div className="field">
                     <label className="field-label">Total amount *</label>
-                    <input
-                      type="number"
-                      className="field-input"
-                      placeholder="20.00"
-                      min="0.01"
-                      step="0.01"
-                      value={bulkTotalAmount}
-                      onChange={(e) => setBulkTotalAmount(e.target.value)}
-                      disabled={bulkSubmitting}
-                    />
+                    <div className="amount-input-wrap">
+                      <input
+                        type="number"
+                        className="field-input"
+                        placeholder="20.00"
+                        min="0.01"
+                        step="0.01"
+                        value={bulkTotalAmount}
+                        onChange={(e) => setBulkTotalAmount(e.target.value)}
+                        disabled={bulkSubmitting}
+                      />
+                      <BalanceFillButton
+                        currency={bulkCurrency}
+                        disabled={bulkSubmitting}
+                        onFill={setBulkTotalAmount}
+                      />
+                    </div>
                   </div>
                   <div className="field">
                     <label className="field-label">Per transfer amount *</label>
@@ -505,16 +580,6 @@ export default function SimpleTransfer() {
                   </div>
                 )}
 
-                {bulkProgress && (
-                  <div className="alert" style={{ marginBottom: 14 }}>
-                    Sending transfer {bulkProgress.current} of {bulkProgress.total}…
-                  </div>
-                )}
-
-                {bulkMsg && (
-                  <div className={`alert ${bulkMsg.error ? 'alert-error' : 'alert-success'}`}>{bulkMsg.text}</div>
-                )}
-
                 <button
                   type="submit"
                   className="btn btn-primary"
@@ -528,6 +593,19 @@ export default function SimpleTransfer() {
                       : 'Starting batch…'
                     : `Start batch (${bulkPreview?.count ?? 0} transfers)`}
                 </button>
+                {bulkProgress && (
+                  <div className="alert" style={{ marginTop: 12 }}>
+                    Sending transfer {bulkProgress.current} of {bulkProgress.total}…
+                  </div>
+                )}
+                {bulkMsg && (
+                  <div
+                    className={`alert ${bulkMsg.error ? 'alert-error' : 'alert-success'}`}
+                    style={{ marginTop: 12 }}
+                  >
+                    {bulkMsg.text}
+                  </div>
+                )}
               </form>
             )}
           </div>
