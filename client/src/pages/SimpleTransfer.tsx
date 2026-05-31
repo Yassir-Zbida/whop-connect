@@ -432,32 +432,20 @@ export default function SimpleTransfer() {
               <Icon d={IconPaths.dollar} size={14} />
               <span className="card-title">Account balance</span>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <select
-                className="select-native"
-                value={overviewCurrency}
-                onChange={(e) => setOverviewCurrency(e.target.value)}
-                disabled={!companyId || loadingBalances}
-                aria-label="Balance currency"
-                style={{ minWidth: 160 }}
-              >
-                {overviewBalanceOptions.map((code) => (
-                  <option key={code} value={code}>
-                    {currencyLabel(code)}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm"
-                onClick={loadBalances}
-                disabled={!companyId || loadingBalances}
-                style={{ gap: 6 }}
-              >
-                <Icon d={IconPaths.refresh} size={12} />
-                {loadingBalances ? 'Loading…' : 'Refresh'}
-              </button>
-            </div>
+            <select
+              className="select-native"
+              value={overviewCurrency}
+              onChange={(e) => setOverviewCurrency(e.target.value)}
+              disabled={!companyId || loadingBalances}
+              aria-label="Balance currency"
+              style={{ minWidth: 160 }}
+            >
+              {overviewBalanceOptions.map((code) => (
+                <option key={code} value={code}>
+                  {currencyLabel(code)}
+                </option>
+              ))}
+            </select>
           </div>
           <div className="card-body" style={{ paddingTop: 16 }}>
             {!companyId ? (
